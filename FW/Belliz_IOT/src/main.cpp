@@ -24,21 +24,21 @@
 #define RELE_1 12
 #define RELE_2 13
 #define DHTPIN 4 //PINO DIGITAL UTILIZADO PELO DHT22
+#define GPIO_BUTTON 16
+
+ // GPIO 34 = ADC1_CHANNEL_6 (BUFFER_ACS712)
 
 //////////////////////////////DEFINIÇÕES DE VALORES//////////////////////////////////
 
 #define DHTTYPE DHT22 //DEFINE O MODELO DO SENSOR (DHT22 / AM2302)
-#define EEPROM_SIZE 1024
 #define MAX 600
 #define BAUD_RATE_SERIAL 115200
-#define UPDATE_TIME_EPOCH 120
 #define TIMER_NUM 0
 #define TIMER_PRESCALER 80
 #define PROGRESSIVE_COUNT true
 #define ALARM_TIME_us 1660
 #define BROKER_PORT 1883
 #define OFFSET_AC712 1829
-#define MQTT_SEND_TIME 1200
 
 ///////////////////////////////DEFINIÇÕES DE VARIÁVEIS/////////////////////////
 
@@ -55,203 +55,178 @@ const char *password = "ac1ce0ss6_mesh";
 const char *brokerUser = "Default";
 const char *brokerPass = "a9232c2f-d3ec-4bfc-a382-82c9c29808ba";
 const char *broker = "mqtt.tago.io";
-const char *outTopic = "C8F09E9F541C"; 
+const char *outTopic = "TESTE"; 
 
 
 // VARIÁVEIS TIPO BOOLEANAS
 bool flag_timer = true,
-     flag_pulse = true,
      wifi_flag = false,
-     state_relay = false;
+     state_relay = false,
+     debug = true;
      
-
 // VARIÁVEIS TIPO INTEIRAS
 int count_pulse = 0,
-    count_1m = 0,
-    count_timerpulse = 0,
+    count_timerpulse = 0, 
     amostras_index = 0,
-    timer_millis = 0,
-    readeeprom = 0,
     address = 0,
     address_index = 0,
     rpm = 0,
-    time_relay = 0,
-    a = 32,
-    time_wifi = 0;
-
-unsigned long lastmillis = 0;
+    device = 0,
+    time_relay = 0;
 
 // VARIÁVEIS TIPO REAL
-float temp1 = 0,
+float temperature = 0,
       amostras[MAX + 1],
       rms = 0,
       current = 0,
-      humidity = 0,
-      ambient_temp = 0;
+      temperature_room = 0,
+      humidity_room = 0;
 
 // VARIÁVEIS DO TIPO LONG (64BITS)
-unsigned long epochTime = 0,
-              saveepoch = 0;
-
+unsigned long epochTime = 0;
+              
 // VARIÁVEIS TIPO CHAR(CARACTER)
 char messages[100];
 
- String mac = "TESTE";
+String mac = "";
 
-///////////////////////////////DEFINIÇÃO DE FUNÇÕES/////////////////////////////
+///////////////////////////////DECLARAÇÃO DOS PROTÓTIPOS DE FUNÇÕES/////////////////////////////
 
-void ConnectBroker();
+// Função responsável por executar a máquina de estados principal
+void executeMachineState();
 
-void getparameters();
+// Função para conexão do Broker MQTT
+void brokerConnect();
 
-void Send_MQTT_JSON();
+// Função para conexão da rede wi-fi
+void wifiConnect();
 
-void WifiConnect();
+// Função para configuração do ADC1
+void adc1Config();
+
+// Função para obter MAC sem traços e pontos 
+int getMAC();
+
+// Função para atualização do epoch (data e hora) de acordo com o servidor ntp
+void updateEpoch();
+
+// Função para atualizar o epoch internamente sem a necessidade do wi-fi
+unsigned long getTime();
+
+// Função para indicar se o dispositivo é Master = 0 (Com Jumper) ou Slave = 1 (Sem Jumper)
+int selectModeDevice();
+
+// Função para configuração da interrupção do TIMER0
+void timer0Config(); 
+
+// Função para calcular a corrente elétrica
+void currentEletricCalc();
+
+// Função para cálculo da temperatura
+void temperatureCalc();
+
+// Função para realizar a leitura do sensor DHT22
+void AmbientTempHumidity();
+
+// Função para enviar os dados via MQTT 
+void sendData();
+
+
+
+
+
+void reconnectwifi();
+
+void RPM_calc();
 
 void eepromWrite();
 
 void eepromRead();
 
-void reconnectwifi();
 
-void updateEpoch();
 
-void current_calc();
 
-void RPM();
 
-void Ambient_Temp_Humidity();
-
-///////////////////////////////INSTÂNCIA DE STRUCT - CONFIGURAÇÃO DO TIMER/////////////////////////////
 
 hw_timer_t *Timer0_Cfg = NULL;
-
-///////////////////////////////DECLARAÇÃO DE OBJETOS - WiFi Client/////////////////////////////
 
 WiFiClient espClient;
 
 PubSubClient client(espClient);
 
-///////////////////////////////DECLARAÇÃO DE OBJETOS - MAX 6675/////////////////////////////
-
 MAX6675 temp(SCK_MAX6675, CS_MAX6675, SO_MAX6675);
-
-///////////////////////////////DECLARAÇÃO DE OBJETOS - DHT11/////////////////////////////
 
 DHT dht(DHTPIN, DHTTYPE); //PASSA OS PARÂMETROS PARA A FUNÇÃO
  
 ///////////////////////////////CONFIGURAÇÃO MÁQUINA DE ESTADOS///////////////////
 
-enum MachineStates
-{
-  WiFi_Connect = 0,
-  WiFi_Reconnect,
-  Broker_Connect,
-  Epoch_Update,
-  Data_Request,
-  Flash_Read,
-  MQTT_SendPackage,
+enum MachineStates{
+  Read_Eltric_Current = 0,
+  Read_RPM,
+  Read_Temperature,
+  Send_Data
+
 };
 
 MachineStates CurrentState;
 
 
-
-///////////////////////////////FUNÇÃO DE TRATAMENTO DE INTERRUPÇÃO EXTERNA///////////////////
-
-void IRAM_ATTR ExternalInterrupt_ISR()
-{
+void IRAM_ATTR ExternalInterrupt_ISR(){ // Interrupção externa para contagem de pulsos do cooler
   count_pulse++;
-  a = 343;
 }
 
-///////////////////////////////FUNÇÃO DE TRATAMENTO DE INTERRUPÇÃO DE TIMER///////////////////
+void IRAM_ATTR Timer0_ISR(){ // Tempo de estouro a cada 1,6ms
 
-void IRAM_ATTR Timer0_ISR() // 16 ms 
-{
-  flag_timer = true;
-  count_1m++;
-  count_timerpulse++;
-  time_relay++;
-  time_wifi++;
-}
-
-//////////////////////////////FUNÇÃO DE CONEXÃO DA REDE WIFI///////////////////
-
-void WifiConnect()
-{
-  Serial.println("FUNCAO WIFI");
-  Serial.print("Conectando em: ");
-  Serial.println(ssid);
-
-  WiFi.begin(ssid, password);
-
-  Serial.print("Conectando");
-
-  while(WiFi.status() != WL_CONNECTED)
-  {
-    Serial.print(".");
-    delay(500);
+  if(CurrentState == Read_Eltric_Current){ 
+    flag_timer = true;   // Coleta a cada 1,6ms (10 amostras por ciclo 16,6ms)
   }
-    Serial.println("");
-    Serial.print("Conectado em: ");
-    Serial.println(ssid);
 
-  CurrentState = Broker_Connect;
+  if(CurrentState == Read_RPM){ 
+    count_timerpulse++;  // para contagem até 1seg para cálculo do RPM_calc
+  }
+
 }
 
-//////////////////////////////FUNÇÃO DE REQUISIÇÃO DE HORA/DATA///////////////////
 
-unsigned long getTime()
+
+
+
+
+
+
+
+
+
+
+
+//////////////////////////////FUNÇÃO DE CONTAGEM DE PULSOS - RPM_calc///////////////////
+
+void RPM_calc()
 {
-  time_t now;
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo))
-  {
-    return (0);
-  }
-  time(&now);
-  return now;
-}
 
-//////////////////////////////FUNÇÃO DE RECONEXÃO NO CLIENT MQTT//////////////////
+  attachInterrupt(PULSE, ExternalInterrupt_ISR, FALLING);
 
-void ConnectBroker()
-{
-  // if (!client.connected() && WiFi.status() == WL_CONNECTED)
-  // {
-  //   CurrentState = Flash_Write;
-  //   Serial.print("Conectando em: ");
-  //   Serial.println(broker);
-
-    if (client.connect("", brokerUser, brokerPass))
-    {
-      Serial.print("Conectado em: ");
-      Serial.println(broker);
-      CurrentState = Data_Request;
-    }
-
-    else if (WiFi.status() == WL_DISCONNECTED)
-    {
-      Serial.println("Tentando conectar novamente no WIFI");
-      CurrentState = WiFi_Connect;
-    }
-  }
-// }
-//////////////////////////////FUNÇÃO DE CONTAGEM DE PULSOS - RPM///////////////////
-
-void RPM()
-{
   if (count_timerpulse >= 600)
   {
-    Serial.print("RPM1: ");
-    Serial.println(count_pulse);
+    if (debug == true){
+      Serial.print("RPM1: ");
+      Serial.println(count_pulse);
+      Serial.println(count_pulse);
+    }
+
     count_pulse = (count_pulse / 7);
     count_pulse = (count_pulse * 30);
-    Serial.print("RPM: ");
-    Serial.println(count_pulse);
+
+    if (debug == true){
+      Serial.print("RPM_calc: ");
+      Serial.println(count_pulse);
+    }
+
     count_timerpulse = 0;
   }
+
+   detachInterrupt(PULSE);
+
 }
 
 //////////////////////////////FUNÇÃO DE ACIONAMENTO DOS RELÉS//////////////////
@@ -269,58 +244,17 @@ void Relay_Fuction()
   }
 }
 
-//////////////////////////////FUNÇÃO DE REQUISIÇÃO DE DADOS///////////////////
-
-void getparameters()
-{
- // Serial.println("Funcao aquisicao de dados");
-
-  detachInterrupt(PULSE);
-  RPM();
-  Serial.println(a);
-  attachInterrupt(PULSE, ExternalInterrupt_ISR, FALLING);
-  //current_calc();
-//  Serial.print("Corrente: ");
-//  Serial.println(current);
-
-  temp1 = temp.readCelsius();
-//  Serial.print("Temperatura: ");
-//  Serial.println(temp1);
-
-  // Serial.print("Umidade: "); //IMPRIME O TEXTO NA SERIAL
-  // Serial.print(dht.readHumidity()); //IMPRIME NA SERIAL O VALOR DE UMIDADE MEDIDO
-  // Serial.print("%"); //IMPRIME O TEXTO NA SERIAL 
-  // Serial.print(" / Temperatura: "); //IMPRIME O TEXTO NA SERIAL
-  // Serial.print(dht.readTemperature(), 0); //IMPRIME NA SERIAL O VALOR DE UMIDADE MEDIDO E REMOVE A PARTE DECIMAL
-  // Serial.println("*C"); //IMPRIME O TEXTO NA SERIALAmbient_Temp_Humidity();
-
-  epochTime = getTime();
-//  Serial.print("epoch:");
-//  Serial.println(epochTime);
-
-  CurrentState = MQTT_SendPackage;
-}
-
 /////////////////////////////FUNÇÃO DE ENVIO DOS DADOS VIA MQTT///////////////////
 
-void Send_MQTT_JSON()
+void sendData()
 {
-  if (count_1m >= MQTT_SEND_TIME)
-  {
-   // Serial.println("Funcao de envio MQTT");
-
-    getparameters();
-
-    attachInterrupt(PULSE, ExternalInterrupt_ISR, FALLING);
-    snprintf(messages, 100, "{\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"humidity\":%.2f, \"temp_ambient\":%.2f}", current, count_pulse, temp1, epochTime, humidity, ambient_temp);
+    snprintf(messages, 100, "{\"device\":%d,\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"temperature_room\":%.2f, \"humidity_room\":%.2f}", device, current, count_pulse, temperature, epochTime, humidity_room, temperature_room);
     client.publish(outTopic, messages);
-    Serial.println(messages);
-    Serial.println("");
-    count_1m = 0;
-    count_pulse = 0;
-    rpm = 0;
-    CurrentState = Data_Request;
-  }
+    
+    if(debug){
+      Serial.println(messages);
+      Serial.println("");
+    }
 }
 
 //////////////////////////////FUNÇÃO DE ESCRITA NA MEMÓRIA FLASH///////////////////
@@ -330,13 +264,11 @@ void eepromWrite()
   if (!client.connected())
   {
     Serial.println("Gravando na eeprom");
-    getparameters();
-    snprintf(messages, 100, "{\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d}", current, count_pulse, temp1, epochTime);
+    snprintf(messages, 100, "{\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d}", current, count_pulse, temperature, epochTime);
     EEPROM.put(address, messages);
     EEPROM.commit();
     address += sizeof(messages);
     address_index++;
-    CurrentState = Broker_Connect;
   }
 }
 
@@ -357,7 +289,7 @@ void eepromRead()
       address += sizeof(messages);
     }
   }
-  CurrentState = Epoch_Update;
+
 }
 
 //////////////////////////////FUNÇÃO DE RECONEXÃO DA REDE WIFI///////////////////
@@ -373,30 +305,15 @@ void reconnectwifi()
   }
 }
 
-//////////////////////////////FUNÇÃO DE ATUALIZAÇÃO DO VALOR EPOCH///////////////////
+/////////////////////////////FUNÇÃO DE CÁLCULO DA CORRENTE ELÉTRICA///////////////////
 
-void updateEpoch()
-{
-  Serial.println("Função atualização epoch");
+void currentEletricCalc(){
 
-  if (epochTime - saveepoch >= UPDATE_TIME_EPOCH)
-  {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  // Ativa o alarme
 
-    Serial.println("epoch atualizado");
+  timerAlarmEnable(Timer0_Cfg);
+  
 
-    epochTime = getTime();
-
-    saveepoch = epochTime;
-  }
-  CurrentState = Data_Request;
-}
-
-//////////////////////////////FUNÇÃO DE CÁLCULO DA CORRENTE ELÉTRICA///////////////////
-
-void current_calc()
-{
-  //Serial.println("Função Corrente");
   if (flag_timer)
   {
     amostras_index++;
@@ -407,7 +324,7 @@ void current_calc()
 
     if (amostras_index == MAX)
     {
-      timerDetachInterrupt(Timer0_Cfg);
+      timerAlarmDisable(Timer0_Cfg);
       for (int i = 0; i <= MAX; i++)
       {
         rms += amostras[i] * amostras[i];
@@ -425,122 +342,234 @@ void current_calc()
         current = 0.00;
       }
 
-      timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
+      timerAlarmEnable(Timer0_Cfg);
     }
   }
 }
 
-//////////////////////////////FUNÇÃO DHT22///////////////////
 
-void Ambient_Temp_Humidity()
-{
-  Serial.print("Umidade: "); //IMPRIME O TEXTO NA SERIAL
-  Serial.print(dht.readHumidity()); //IMPRIME NA SERIAL O VALOR DE UMIDADE MEDIDO
-  Serial.print("%"); //IMPRIME O TEXTO NA SERIAL 
-  Serial.print(" / Temperatura: "); //IMPRIME O TEXTO NA SERIAL
-  Serial.print(dht.readTemperature(), 0); //IMPRIME NA SERIAL O VALOR DE UMIDADE MEDIDO E REMOVE A PARTE DECIMAL
-  Serial.println("*C"); //IMPRIME O TEXTO NA SERIAL
+
+
+
+
+
+
+void setup() {
+
+  pinMode(RELE_1, OUTPUT);
+  pinMode(RELE_2, OUTPUT);
+
+  digitalWrite(RELE_1, LOW);
+  digitalWrite(RELE_2, LOW);
+
+  Serial.begin(BAUD_RATE_SERIAL);
+
+  wifiConnect();
+
+  client.setServer(broker, BROKER_PORT); // Função para definição de Broker mqtt e porta
+
+  brokerConnect();
+
+  Wire.begin(); //Esta biblioteca permite a comunicação com dispositivos I2C.
+
+  adc1Config();
+  timer0Config();
+
+  updateEpoch();
+
+  getMAC();
+
+  dht.begin();
+
+  device = selectModeDevice();
+
 }
 
-//////////////////////////////FUNÇÃO MÁQUINA DE ESTADOS///////////////////
+void loop(){
 
-void ExecuteMachineState() // INICIA MÁQUINA DE ESTADOS
-{
-  switch (CurrentState) // FUNÇÃO DE TROCAR-CASO VARIÁVEL CurrentState
-  {
-  case WiFi_Connect:
-    WifiConnect();
+  executeMachineState();
+ 
+}
+
+void executeMachineState(){
+
+  switch (CurrentState){
+
+  case Read_Eltric_Current:
+    currentEletricCalc();
     break;
 
-  case Broker_Connect: 
-    ConnectBroker();
+  case Read_RPM:
+    RPM_calc();
+    break;         
+
+  case Read_Temperature:
+    temperatureCalc();
     break;
 
-  case Data_Request:
-    getparameters();
-    break;
-
-  case MQTT_SendPackage:
-    Send_MQTT_JSON();
-    break;
-
-  case Flash_Read:
-    eepromRead();
-    break;
-
-  case Epoch_Update:
-    updateEpoch();
+  case Send_Data:
+    sendData();
     break;
   }
 }
 
-void setup() // FUNÇÃO DE CONFIGURAÇÃO
-{
+void timer0Config(){ 
 
-  dht.begin(); //INICIALIZA A FUNÇÃO DO DHT11
-
-  pinMode(RELE_1, OUTPUT);
-  digitalWrite(RELE_1, HIGH);
-
-  pinMode(RELE_2, OUTPUT);
-  digitalWrite(RELE_2, HIGH);
-
-  // CONFIGURAÇÃO DO ADC DA ESP32
-
-  adc1_config_width(ADC_WIDTH_BIT_12); // CONFIGURA RESOLUÇÃO DE 12 BITS NO ADC1
-
-  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11); // CONFIGURA RESOLUÇÃO DE 11 dB NO ADC1 (GPIO 34)
-
-  // CONFIGURAÇÃO DA INTERRUPÇÃO DE TIMER0 DA ESP32
-
+/* 0 - seleção do timer a ser usado, de 0 a 3.
+   80 - prescaler. O clock principal do ESP32 é 80MHz. Dividimos por 80 para ter 1us por tick.
+   true - true para contador progressivo, false para regressivo 
+*/
   Timer0_Cfg = timerBegin(TIMER_NUM, TIMER_PRESCALER, PROGRESSIVE_COUNT);
-
+   
+/* conecta à interrupção do timer
+  - timer é a instância do hw_timer
+  - endereço da função a ser chamada pelo timer
+  - edge = true gera uma interrupção
+*/  
   timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
 
+ /* - o timer instanciado no inicio
+    - o valor em us. 1660 = 1,66 ms (1660 us * 600 = 1 seg) Isso para obter 10 coletas em uma senóide (60 Hz).
+    frequência = 1/P => 1/60Hz = 0,0166667 ou 16ms para possuímos 10 amostras precisamos de um timer  a cada 1,6ms.
+    - auto-reload. true para repetir o alarme
+*/  
   timerAlarmWrite(Timer0_Cfg, ALARM_TIME_us, true);
 
-  timerAlarmEnable(Timer0_Cfg);
-
-  // CONFIGURAÇÃO DA INTERRUPÇÃO EXTERNA DA ESP32
-
-  attachInterrupt(PULSE, ExternalInterrupt_ISR, FALLING);
-
-  // INICIALIZAÇÃO DA BIBLIOTECA WIRE (I2C)
-
-  Wire.begin();
-
-  // INICIALIZAÇÃO DA SERIAL COM TAXA DE TRANSMISSÃO EM 115200
-
-  Serial.begin(BAUD_RATE_SERIAL);
-
-  // FUNÇÃO DE CONEXÃO NO WIFI
-
-  // WifiConnect();
-
-  // CONFIGURAÇÃO DE SERVIDOR DO CLIENT MQTT
-
-  client.setServer(broker, BROKER_PORT);
-
-  // CONFIGURAÇÃO DO NTP SERVER
-
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-
-  epochTime = getTime();
-
-  delayMicroseconds(30);
-
-  CurrentState = WiFi_Connect;
-
-  lastmillis = millis();
-
-  Serial.print("ESP Board MAC Address:  ");
-  mac = WiFi.macAddress();
-  Serial.println(mac);
 }
 
-void loop() // FUNÇÃO LAÇO PRINCIPAL
+void adc1Config(){
+
+  adc1_config_width(ADC_WIDTH_BIT_12); // CONFIGURA RESOLUÇÃO DE 12 BITS NO ADC1
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11); // CONFIGURA RESOLUÇÃO DE 11 dB NO ADC1 (GPIO 34)
+
+}
+
+int getMAC(){
+
+  int macWithoutDots;
+
+  mac = WiFi.macAddress();
+
+  if(debug){
+    Serial.print("ESP Board MAC Address:  ");
+    Serial.println(mac);
+  }
+
+  return macWithoutDots;
+}
+
+int selectModeDevice(){
+
+  int device;
+
+  if(digitalRead(GPIO_BUTTON)){
+    if(debug){
+      Serial.println("DEVICE: SLAVE");
+    }
+    device = 1;
+  }
+  else{
+    if(debug){
+    Serial.println("DEVICE: MASTER");
+    }
+    device = 0;
+  }
+
+  return device;
+
+}
+
+void updateEpoch(){
+  
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  if(debug){
+    Serial.print("Update epoch: ");
+    Serial.println(getTime());
+  }
+
+}
+
+void brokerConnect(){
+
+  if (debug == true){
+    Serial.println("--------------------------------------- Function brokerConnect");
+    Serial.print("Conecting to: ");
+    Serial.println(broker);
+  }
+
+  client.connect("", brokerUser, brokerPass);
+
+  if (!client.state()){ // Função de conexão com Broker com retorno positivo ou negativo
+  
+    if (debug == true){
+      Serial.println("SUCCESS!");
+    }
+  }
+    else {
+      if (debug == true){
+        Serial.println("Fail in conection! ");
+        Serial.print("state: ");
+        Serial.println(client.state());
+        }
+  }
+}
+
+unsigned long getTime()
 {
-  ExecuteMachineState(); // FUNÇÃO DE EXECUÇÃO DA MÁQUINA DE ESTADOS.
-  current_calc();
-  //Relay_Fuction();
+  time_t now;
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo))
+  {
+    return (0);
+  }
+  time(&now);
+
+  return now;
+}
+
+void wifiConnect(){
+  
+  if (debug == true){
+    Serial.println("--------------------------------------- Function wifiConnect");
+    Serial.print("Conecting to: ");
+    Serial.println(ssid);
+  }
+
+  WiFi.begin(ssid, password);
+
+  while(WiFi.status() != WL_CONNECTED){
+
+    if (debug == true){
+      Serial.print(".");
+    }
+    delay(500);
+  }
+
+  if (debug == true){
+    Serial.println("");
+    Serial.println("SUCCESS!");
+  }
+
+}
+
+void temperatureCalc(){
+
+temperature = temp.readCelsius();
+
+}
+
+void AmbientTempHumidity(){
+
+  humidity_room = dht.readHumidity();
+  temperature_room = dht.readTemperature();
+
+  if(debug){
+    Serial.print("Umidade: "); //IMPRIME O TEXTO NA SERIAL
+    Serial.print(dht.readHumidity()); //IMPRIME NA SERIAL O VALOR DE UMIDADE MEDIDO
+    Serial.println("%"); //IMPRIME O TEXTO NA SERIAL 
+    Serial.print(" / Temperatura: "); //IMPRIME O TEXTO NA SERIAL
+    Serial.print(dht.readTemperature(), 0); //IMPRIME NA SERIAL O VALOR DE UMIDADE MEDIDO E REMOVE A PARTE DECIMAL
+    Serial.println("*C"); //IMPRIME O TEXTO NA SERIAL
+  }
 }
