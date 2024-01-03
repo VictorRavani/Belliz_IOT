@@ -1,0 +1,56 @@
+#include <Arduino.h>
+
+#define PULSE 33
+
+hw_timer_t *Timer0_Cfg = NULL;
+
+bool flag_timer = true,
+     flag_pulse = true;
+
+int count_pulse=0, 
+    count_60s=0;
+
+void IRAM_ATTR ExternalInterrupt_ISR()
+{
+  flag_pulse = true;
+}
+
+void IRAM_ATTR Timer0_ISR()
+{
+  flag_timer = true;
+}
+
+void setup()
+{
+
+  Serial.begin(115200);
+
+  Timer0_Cfg = timerBegin(0, 80, true);
+
+  timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
+
+  timerAlarmWrite(Timer0_Cfg, 1000000, true);
+
+  timerAlarmEnable(Timer0_Cfg);
+
+  attachInterrupt(PULSE, ExternalInterrupt_ISR, FALLING);
+}
+
+void loop()
+{
+  if (flag_timer)
+  {
+    count_60s++;
+    count_pulse = (count_pulse/7);
+    count_pulse = (count_pulse * 60);
+    Serial.println(count_pulse);
+    flag_timer = false;
+    count_pulse = 0;
+  }
+
+  if (flag_pulse)
+  {
+    count_pulse++;
+    flag_pulse = 0;
+  }
+}

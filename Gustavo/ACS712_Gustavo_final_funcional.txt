@@ -1,0 +1,76 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <esp_log.h>
+#include <esp_err.h>
+#include <driver/adc.h>
+#include <esp_adc_cal.h>
+
+#define MAX 600
+
+hw_timer_t *Timer0_Cfg = NULL;
+
+bool flag_timer = false;
+float amostras[MAX],
+      rms = 0;
+int amostras_index = 0;
+
+void IRAM_ATTR Timer0_ISR()
+{
+  flag_timer = true;
+}
+
+void setup()
+{
+  adc1_config_width(ADC_WIDTH_BIT_12);//Configura a resolucao
+ 
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);//Configura a atenuacao
+
+  Timer0_Cfg = timerBegin(0, 80, true);
+
+  timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
+
+  timerAlarmWrite(Timer0_Cfg, 1660, true);
+
+  timerAlarmEnable(Timer0_Cfg);
+
+  Wire.begin();
+
+  Serial.begin(115200);
+}
+
+
+void loop()
+{
+ if (flag_timer)
+  {
+    timerDetachInterrupt(Timer0_Cfg);
+    amostras_index++;
+    // long long temp = millis();
+    amostras[amostras_index] = adc1_get_raw(ADC1_CHANNEL_6) - 1829;
+    // temp = millis() - temp;
+    // Serial.println(temp);
+    timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
+    if (amostras_index == MAX)
+    {
+      timerDetachInterrupt(Timer0_Cfg);
+      for (int i = 0; i <= MAX; i++)
+      {
+      //Serial.println(amostras[i]);
+      rms += amostras[i] * amostras[i];
+      }
+
+      // rms= rms rms
+      // Serial.println(rms);
+
+      rms /= (double)MAX;
+      rms = sqrt(rms);
+      //Serial.println(rms);
+      float current = (0.0127 * rms) - 0.1153;
+      Serial.println(current);
+      amostras_index = 0;
+      timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
+    
+    }
+    flag_timer = false;
+  }
+}
