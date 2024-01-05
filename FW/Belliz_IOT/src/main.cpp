@@ -1,50 +1,58 @@
-//////////////////////////////BIBLIOTECAS AUXILIARES//////////////////////////////////
+////////////////////////////// BIBLIOTECAS /////////////////////////////////////////////
 
 #include <Arduino.h>
 #include <max6675.h>
 #include <Wire.h>
 #include <driver/adc.h>
-#include <esp_adc_cal.h>
+//#include <esp_adc_cal.h>
 #include <WiFi.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
+//#include <freertos/FreeRTOS.h>
+//#include <freertos/task.h>
 #include <PubSubClient.h>
-#include "time.h"
+#include <time.h>
 #include <EEPROM.h>
-#include <esp_ipc.h>
+//#include <esp_ipc.h>
 #include "DHT.h"
 #include <Adafruit_Sensor.h>
 
-//////////////////////////////MAPEAMENTO DE HARWARE//////////////////////////////////
+////////////////////////////// MAPEAMENTO DE HARWARE //////////////////////////////////
 
 #define PULSE 26
 #define SCK_MAX6675 25
 #define CS_MAX6675 33
 #define SO_MAX6675 32
-#define RELE_1 12
-#define RELE_2 13
+#define RELE_1 19 // Led RELE_1 = 23
+#define RELE_2 18 // Led RELE_1 = 17
 #define DHTPIN 4 //PINO DIGITAL UTILIZADO PELO DHT22
 #define GPIO_BUTTON 16
+#define GPIO_LED_VM 23 // Led VM =19
+#define GPIO_LED_VD 17 // Led VD =18
 
  // GPIO 34 = ADC1_CHANNEL_6 (BUFFER_ACS712)
 
-//////////////////////////////DEFINIÇÕES DE VALORES//////////////////////////////////
+////////////////////////////// DEFINIÇÕES //////////////////////////////////////////////
 
-#define DHTTYPE DHT22 //DEFINE O MODELO DO SENSOR (DHT22 / AM2302)
+#define DHTTYPE DHT22 //define o modelo do sensor (DHT22 / AM2302)
 #define MAX 600
 #define BAUD_RATE_SERIAL 115200
 #define TIMER_NUM 0
 #define TIMER_PRESCALER 80
 #define PROGRESSIVE_COUNT true
-#define ALARM_TIME_us 1660
+#define ALARM_TIME_US 1660
 #define BROKER_PORT 1883
 #define OFFSET_AC712 1829
+#define MULTIPLY_FOR_1SEC 602
+#define TIME_WAIT 10 // 10 segundos
+#define TIME_CHECK_CONTROL 1 // Verificar a cada 1 segundo
+#define MAX_KB_MEMORY 5040 // 180 registros de 28KB (cada linha de registro possui 28KB)
+#define TIMER_INTERVAL_US 1000000
+#define TIME_CYCLE 900 // 900seg = 15 min
 
-///////////////////////////////DEFINIÇÕES DE VARIÁVEIS/////////////////////////
+/////////////////////////////// DECLARAÇÃO DE VARIÁVEIS /////////////////////////
 
 // NTP SERVER
 const char *ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = (-6 * 3600);
+const long gmtOffset_sec = (-3 * 3600);
 const int daylightOffset_sec = 3600;
 
 // WIFI
@@ -55,26 +63,27 @@ const char *password = "ac1ce0ss6_mesh";
 const char *brokerUser = "Default";
 const char *brokerPass = "a9232c2f-d3ec-4bfc-a382-82c9c29808ba";
 const char *broker = "mqtt.tago.io";
-const char *outTopic = "TESTE"; 
+const char *outTopic = "NULLLLLLLLLL"; 
 
-
-// VARIÁVEIS TIPO BOOLEANAS
-bool flag_timer = true,
+bool flag_timer = false,
      wifi_flag = false,
      state_relay = false,
      debug = true;
      
-// VARIÁVEIS TIPO INTEIRAS
 int count_pulse = 0,
     count_timerpulse = 0, 
     amostras_index = 0,
     address = 0,
-    address_index = 0,
     rpm = 0,
-    device = 0,
-    time_relay = 0;
+    turn = 0,
+    cont_time_cycle = 0,
+    cont_time_waiting = 0,
+    cont_check_station_control = 0,
+    sum_sample = 0;
 
-// VARIÁVEIS TIPO REAL
+// Master = 0 | Slave = 1
+int device = 0;
+
 float temperature = 0,
       amostras[MAX + 1],
       rms = 0,
@@ -82,15 +91,48 @@ float temperature = 0,
       temperature_room = 0,
       humidity_room = 0;
 
-// VARIÁVEIS DO TIPO LONG (64BITS)
-unsigned long epochTime = 0;
-              
-// VARIÁVEIS TIPO CHAR(CARACTER)
-char messages[100];
+unsigned long epochTime = 0,
+              last_millis_cycle = 0;     
+
+char messages[110];
+
+char mac_address [13];
+
+char mac_not_pointers [13];
 
 String mac = "";
 
-///////////////////////////////DECLARAÇÃO DOS PROTÓTIPOS DE FUNÇÕES/////////////////////////////
+hw_timer_t *timer0 = NULL;
+hw_timer_t *timer1 = NULL;
+
+time_t now;
+  
+struct tm timeinfo;
+
+WiFiClient espClient;
+
+PubSubClient client(espClient);
+
+MAX6675 temp(SCK_MAX6675, CS_MAX6675, SO_MAX6675);
+
+DHT dht(DHTPIN, DHTTYPE);
+
+enum MachineStates{
+  read_eltric_current = 0,
+  read_rpm,
+  read_temperature,
+  read_temp_humidity_romm,
+  read_epoch,
+  check_connections,
+  send_data,
+  save_data,
+  waiting_for_time,
+  waiting_word_day
+};
+
+MachineStates CurrentState;
+
+/////////////////////////////// PROTÓTIPOS DE FUNÇÕES /////////////////////////////////////
 
 // Função responsável por executar a máquina de estados principal
 void executeMachineState();
@@ -119,6 +161,9 @@ int selectModeDevice();
 // Função para configuração da interrupção do TIMER0
 void timer0Config(); 
 
+// Função para configuração da interrupção do TIMER1
+void timer1Config();
+
 // Função para calcular a corrente elétrica
 void currentEletricCalc();
 
@@ -126,241 +171,83 @@ void currentEletricCalc();
 void temperatureCalc();
 
 // Função para realizar a leitura do sensor DHT22
-void AmbientTempHumidity();
+void ambientTempHumidity();
 
 // Função para enviar os dados via MQTT 
 void sendData();
 
+// Função para calcular o RPM
+void rpmCalc();
 
+// Função para verificar a conexão wi-fi
+void checkWifi();
 
+// Função para verificar a conexão com o Broker
+void checkBroker();
 
-
-void reconnectwifi();
-
-void RPM_calc();
-
+// Função para gravar as informações na memória EEPROM 
 void eepromWrite();
 
+// Função para escrita na memória EEPROM
+void eepromWrite();
+
+// Função para aguardar o tempo de ciclo 
+void waitingTime();
+
+// Função para realizar a leitura da memória Flash "EEPROM"
 void eepromRead();
 
+// Função para registro do tempo
+void readEpoch();
 
+// Função para controle dos ciclos de 15min das estações
+void stationControl();
 
+// Função para controlar o dia de trabalho da estação
+// 1 = Dia de trabalho | 0 = Folga 
+int checkDayOfWork();
 
+// Função para definir o estado atual dos periféricos
+void initIOs();
 
+// Função para verificar se os relés estão desligados 
+void checkShutdown();
 
-hw_timer_t *Timer0_Cfg = NULL;
-
-WiFiClient espClient;
-
-PubSubClient client(espClient);
-
-MAX6675 temp(SCK_MAX6675, CS_MAX6675, SO_MAX6675);
-
-DHT dht(DHTPIN, DHTTYPE); //PASSA OS PARÂMETROS PARA A FUNÇÃO
- 
-///////////////////////////////CONFIGURAÇÃO MÁQUINA DE ESTADOS///////////////////
-
-enum MachineStates{
-  Read_Eltric_Current = 0,
-  Read_RPM,
-  Read_Temperature,
-  Send_Data
-
-};
-
-MachineStates CurrentState;
-
+/////////////////////////////// FUNÇÕES DE CALLBACK ///////////////////////////////////
 
 void IRAM_ATTR ExternalInterrupt_ISR(){ // Interrupção externa para contagem de pulsos do cooler
+  
   count_pulse++;
 }
 
 void IRAM_ATTR Timer0_ISR(){ // Tempo de estouro a cada 1,6ms
 
-  if(CurrentState == Read_Eltric_Current){ 
+  if(CurrentState == read_eltric_current){ 
     flag_timer = true;   // Coleta a cada 1,6ms (10 amostras por ciclo 16,6ms)
   }
 
-  if(CurrentState == Read_RPM){ 
-    count_timerpulse++;  // para contagem até 1seg para cálculo do RPM_calc
-  }
-
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-//////////////////////////////FUNÇÃO DE CONTAGEM DE PULSOS - RPM_calc///////////////////
-
-void RPM_calc()
-{
-
-  attachInterrupt(PULSE, ExternalInterrupt_ISR, FALLING);
-
-  if (count_timerpulse >= 600)
-  {
-    if (debug == true){
-      Serial.print("RPM1: ");
-      Serial.println(count_pulse);
-      Serial.println(count_pulse);
-    }
-
-    count_pulse = (count_pulse / 7);
-    count_pulse = (count_pulse * 30);
-
-    if (debug == true){
-      Serial.print("RPM_calc: ");
-      Serial.println(count_pulse);
-    }
-
-    count_timerpulse = 0;
-  }
-
-   detachInterrupt(PULSE);
-
-}
-
-//////////////////////////////FUNÇÃO DE ACIONAMENTO DOS RELÉS//////////////////
-
-void Relay_Fuction()
-{
-  Serial.println("Funcao do relé");
-  Serial.println(time_relay);
-  if (time_relay >= 540000)
-  {
-    time_relay = 0;
-    state_relay = !state_relay;
-    digitalWrite(RELE_1, state_relay);
-    digitalWrite(RELE_2, state_relay);
+  if(CurrentState == read_rpm){ 
+    count_timerpulse++;  // para contagem até 1seg para cálculo do rpmCalc
   }
 }
 
-/////////////////////////////FUNÇÃO DE ENVIO DOS DADOS VIA MQTT///////////////////
+void IRAM_ATTR Timer1_ISR() { // Interrupção a cada 1seg para contagem de tempo
 
-void sendData()
-{
-    snprintf(messages, 100, "{\"device\":%d,\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"temperature_room\":%.2f, \"humidity_room\":%.2f}", device, current, count_pulse, temperature, epochTime, humidity_room, temperature_room);
-    client.publish(outTopic, messages);
-    
-    if(debug){
-      Serial.println(messages);
-      Serial.println("");
-    }
-}
+  cont_time_cycle ++; 
 
-//////////////////////////////FUNÇÃO DE ESCRITA NA MEMÓRIA FLASH///////////////////
-
-void eepromWrite()
-{
-  if (!client.connected())
-  {
-    Serial.println("Gravando na eeprom");
-    snprintf(messages, 100, "{\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d}", current, count_pulse, temperature, epochTime);
-    EEPROM.put(address, messages);
-    EEPROM.commit();
-    address += sizeof(messages);
-    address_index++;
-  }
-}
-
-//////////////////////////////FUNÇÃO DE LEITURA NA MEMÓRIA FLASH/////////////////////////////
-
-void eepromRead()
-{
-  if (client.connected())
-  {
-    Serial.println("Função Leitura Flash");
-    address = 0;
-    for (int i = 0; i <= address_index; i++)
-    {
-      Serial.println("Lendo eeprom");
-      EEPROM.get(address, messages);
-      Serial.println(messages);
-      client.publish(outTopic, messages);
-      address += sizeof(messages);
-    }
-  }
-
-}
-
-//////////////////////////////FUNÇÃO DE RECONEXÃO DA REDE WIFI///////////////////
-
-void reconnectwifi()
-{
-  // if WiFi is down, try reconnecting every CHECK_WIFI_TIME seconds
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.println("Reconectando no WiFi...");
-    WiFi.begin(ssid, password);
-    wifi_flag = true;
-  }
-}
-
-/////////////////////////////FUNÇÃO DE CÁLCULO DA CORRENTE ELÉTRICA///////////////////
-
-void currentEletricCalc(){
-
-  // Ativa o alarme
-
-  timerAlarmEnable(Timer0_Cfg);
-  
-
-  if (flag_timer)
-  {
-    amostras_index++;
-
-    amostras[amostras_index] = adc1_get_raw(ADC1_CHANNEL_6) - OFFSET_AC712;
-
-    // timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
-
-    if (amostras_index == MAX)
-    {
-      timerAlarmDisable(Timer0_Cfg);
-      for (int i = 0; i <= MAX; i++)
-      {
-        rms += amostras[i] * amostras[i];
-      }
-      
-      rms /= (double)MAX;
-
-      rms = sqrt(rms);
-
-      current = (0.0127 * rms) - 0.1153;
-
-      amostras_index = 0;
-
-      if (current <= 0.99){
-        current = 0.00;
-      }
-
-      timerAlarmEnable(Timer0_Cfg);
-    }
+  if(CurrentState == waiting_for_time){
+    cont_time_waiting ++;
+    cont_check_station_control ++;
   }
 }
 
 
-
-
-
-
-
+////////////////// FUNÇÕES PRINCIPAIS DO FRAMEWORK DO ARDUINO /////////////////////////
 
 void setup() {
 
   pinMode(RELE_1, OUTPUT);
   pinMode(RELE_2, OUTPUT);
-
-  digitalWrite(RELE_1, LOW);
-  digitalWrite(RELE_2, LOW);
 
   Serial.begin(BAUD_RATE_SERIAL);
 
@@ -373,7 +260,10 @@ void setup() {
   Wire.begin(); //Esta biblioteca permite a comunicação com dispositivos I2C.
 
   adc1Config();
+
   timer0Config();
+
+  timer1Config();
 
   updateEpoch();
 
@@ -383,32 +273,66 @@ void setup() {
 
   device = selectModeDevice();
 
+  EEPROM.begin(512);
+
+  if(checkDayOfWork()){
+    initIOs();
+    CurrentState = read_eltric_current;
+  }
+  else{
+    CurrentState = waiting_word_day;
+  }
 }
 
 void loop(){
-
   executeMachineState();
- 
 }
+
+///////////////////////////// FUNÇÕES AUXILIARES //////////////////////////////////
 
 void executeMachineState(){
 
   switch (CurrentState){
 
-  case Read_Eltric_Current:
+  case read_eltric_current:
     currentEletricCalc();
     break;
 
-  case Read_RPM:
-    RPM_calc();
+  case read_rpm:
+    rpmCalc();
     break;         
 
-  case Read_Temperature:
+  case read_temperature:
     temperatureCalc();
     break;
 
-  case Send_Data:
+  case read_temp_humidity_romm:
+    ambientTempHumidity();
+    break;
+
+  case read_epoch:
+    readEpoch();
+    break;  
+
+  case check_connections:
+    checkWifi();
+    checkBroker();
+    break;
+
+  case send_data:
     sendData();
+    break;
+
+  case save_data:
+    eepromWrite();
+    break;
+  
+  case waiting_for_time:
+    waitingTime();
+    break;
+
+  case waiting_word_day:
+    checkDayOfWork();
     break;
   }
 }
@@ -419,21 +343,30 @@ void timer0Config(){
    80 - prescaler. O clock principal do ESP32 é 80MHz. Dividimos por 80 para ter 1us por tick.
    true - true para contador progressivo, false para regressivo 
 */
-  Timer0_Cfg = timerBegin(TIMER_NUM, TIMER_PRESCALER, PROGRESSIVE_COUNT);
+  timer0 = timerBegin(TIMER_NUM, TIMER_PRESCALER, PROGRESSIVE_COUNT);
    
 /* conecta à interrupção do timer
   - timer é a instância do hw_timer
   - endereço da função a ser chamada pelo timer
   - edge = true gera uma interrupção
 */  
-  timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
+  timerAttachInterrupt(timer0, &Timer0_ISR, true);
 
  /* - o timer instanciado no inicio
     - o valor em us. 1660 = 1,66 ms (1660 us * 600 = 1 seg) Isso para obter 10 coletas em uma senóide (60 Hz).
     frequência = 1/P => 1/60Hz = 0,0166667 ou 16ms para possuímos 10 amostras precisamos de um timer  a cada 1,6ms.
     - auto-reload. true para repetir o alarme
 */  
-  timerAlarmWrite(Timer0_Cfg, ALARM_TIME_us, true);
+  timerAlarmWrite(timer0, ALARM_TIME_US, true);
+
+}
+
+void timer1Config(){
+
+  timer1 = timerBegin(1, 80, true); // Timer1, Prescaler 80 (1 us ticks), count up
+  timerAttachInterrupt(timer1, &Timer1_ISR, true); // Attach callback
+  timerAlarmWrite(timer1, TIMER_INTERVAL_US, true); // Set alarm time
+  timerAlarmEnable(timer1); // Enable the alarm
 
 }
 
@@ -447,14 +380,33 @@ void adc1Config(){
 int getMAC(){
 
   int macWithoutDots;
+  int a = 0; 
+  int cont = 0;
 
   mac = WiFi.macAddress();
 
+  const char *mac_char = mac.c_str(); // C8:F0:9E:9F:B0:98 // 17 caracteres + nulo = 18 => C8 F0 9E 9F B0 98
+
+  for (int i = 0; i < 17; i++) {
+
+    if (cont < 2){
+      mac_not_pointers[a] = mac_char[i];
+      a ++;
+    }
+    if (cont == 2){
+      cont = -1;
+    }
+
+    cont ++;
+
+  }  
+
+  outTopic = mac_not_pointers;
+
   if(debug){
     Serial.print("ESP Board MAC Address:  ");
-    Serial.println(mac);
+    Serial.println(outTopic);
   }
-
   return macWithoutDots;
 }
 
@@ -464,13 +416,13 @@ int selectModeDevice(){
 
   if(digitalRead(GPIO_BUTTON)){
     if(debug){
-      Serial.println("DEVICE: SLAVE");
+      Serial.println("Device: SLAVE");
     }
     device = 1;
   }
   else{
     if(debug){
-    Serial.println("DEVICE: MASTER");
+    Serial.println("Device: MASTER");
     }
     device = 0;
   }
@@ -493,32 +445,31 @@ void updateEpoch(){
 void brokerConnect(){
 
   if (debug == true){
-    Serial.println("--------------------------------------- Function brokerConnect");
+    Serial.println("");
+    Serial.println("--------------------------------------- Function BROKER Connect");
     Serial.print("Conecting to: ");
     Serial.println(broker);
   }
 
   client.connect("", brokerUser, brokerPass);
 
-  if (!client.state()){ // Função de conexão com Broker com retorno positivo ou negativo
+  if (!client.state()){ 
   
     if (debug == true){
-      Serial.println("SUCCESS!");
+      Serial.println("Broker: CONNECTED!");
     }
   }
-    else {
-      if (debug == true){
-        Serial.println("Fail in conection! ");
-        Serial.print("state: ");
-        Serial.println(client.state());
-        }
+  else {
+    if (debug == true){
+      Serial.println("Broker: Fail in conection! ");
+      Serial.print("Broker state: ");
+      Serial.println(client.state());
+    }
   }
 }
 
-unsigned long getTime()
-{
-  time_t now;
-  struct tm timeinfo;
+unsigned long getTime(){
+
   if (!getLocalTime(&timeinfo))
   {
     return (0);
@@ -529,47 +480,544 @@ unsigned long getTime()
 }
 
 void wifiConnect(){
+
+  int i = 0;
   
   if (debug == true){
-    Serial.println("--------------------------------------- Function wifiConnect");
+    Serial.println("");
+    Serial.println("--------------------------------------- Function WIFI Connect");
     Serial.print("Conecting to: ");
     Serial.println(ssid);
   }
 
   WiFi.begin(ssid, password);
 
-  while(WiFi.status() != WL_CONNECTED){
+  while((i <= 10) && (WiFi.status() != WL_CONNECTED)){
 
     if (debug == true){
       Serial.print(".");
     }
-    delay(500);
+    i++;
+    delay(1000);
   }
 
-  if (debug == true){
-    Serial.println("");
-    Serial.println("SUCCESS!");
+  if (WiFi.status() != WL_CONNECTED){
+    if (debug == true){
+      Serial.println("");
+      Serial.println("W-Fi: Fail in conection! ");
+      Serial.print("Wi-FI state: ");
+      Serial.println(WiFi.status());
+    }
+  }
+  else{
+    if(debug){
+      Serial.println("");
+      Serial.println("Wi-FI: CONNECTED!");
+    }
   }
 
 }
 
 void temperatureCalc(){
 
-temperature = temp.readCelsius();
+  if(debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Calculate Temperature");
+  }
 
-}
-
-void AmbientTempHumidity(){
-
-  humidity_room = dht.readHumidity();
-  temperature_room = dht.readTemperature();
+  temperature = temp.readCelsius();
 
   if(debug){
-    Serial.print("Umidade: "); //IMPRIME O TEXTO NA SERIAL
-    Serial.print(dht.readHumidity()); //IMPRIME NA SERIAL O VALOR DE UMIDADE MEDIDO
-    Serial.println("%"); //IMPRIME O TEXTO NA SERIAL 
-    Serial.print(" / Temperatura: "); //IMPRIME O TEXTO NA SERIAL
-    Serial.print(dht.readTemperature(), 0); //IMPRIME NA SERIAL O VALOR DE UMIDADE MEDIDO E REMOVE A PARTE DECIMAL
-    Serial.println("*C"); //IMPRIME O TEXTO NA SERIAL
+    Serial.print("Temperature: ");
+    Serial.println(temperature);
+  }
+
+  CurrentState = read_temp_humidity_romm;
+
+}
+
+void ambientTempHumidity(){
+
+  if(device == 0){
+
+    if(debug){
+      Serial.println("");
+      Serial.println("--------------------------------------- Function Read DHT22");
+    }
+
+    humidity_room = dht.readHumidity();
+    temperature_room = dht.readTemperature();
+
+    if(debug){
+      Serial.print("Humidity in room: "); 
+      Serial.print(dht.readHumidity()); 
+      Serial.println("%"); 
+      Serial.print("Temperature in room: "); 
+      Serial.print(dht.readTemperature(), 0); 
+      Serial.println("*C"); 
+    }
+  }
+  CurrentState = read_epoch;
+}
+
+void sendData(){
+
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Send Data");
+    Serial.println("");
+    Serial.print("Topic: ");
+    Serial.println(outTopic);
+    Serial.println("");
+  }
+
+  snprintf(messages, 110, "{\"device\":%d,\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"temp_room\":%.2f, \"humidity_room\":%.2f}", device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
+  client.publish(outTopic, messages);
+    
+  if(debug){
+    Serial.println("");
+    Serial.println(messages);
+    Serial.println("");
+  }
+
+  if (address > 0){
+    eepromRead();
+  }
+
+  if (address == 0){
+    CurrentState = waiting_for_time;
+  }
+  
+}
+
+void currentEletricCalc(){
+
+  if(debug && turn !=  1){
+    Serial.println("");
+    Serial.println("--------------------------------------- Calculate Eletric Current");
+    turn = 1;
+  }
+
+  if (amostras_index == 0){
+    timerAlarmEnable(timer0); // Ativa a iterrupção do timer0
+  }  
+
+  if (flag_timer){
+
+    amostras_index++;
+
+    amostras[amostras_index] = adc1_get_raw(ADC1_CHANNEL_6) - OFFSET_AC712;
+    
+    flag_timer = false;
+
+    sum_sample += adc1_get_raw(ADC1_CHANNEL_6);
+
+    if (amostras_index == MAX){
+      timerAlarmDisable(timer0);
+
+      if(sum_sample > 0){
+
+        for (int i = 0; i <= MAX; i++){
+
+          rms += amostras[i] * amostras[i];
+        }
+        
+        rms /= (double)MAX;
+
+        rms = sqrt(rms);
+
+        current = (0.0127 * rms) - 0.1153;
+      }
+      else{
+        current = 0;
+      }
+
+      amostras_index = 0;
+
+      if(debug){
+        Serial.print("current: ");
+        Serial.println(current);
+      }
+
+        CurrentState = read_rpm;
+        turn = 0;
+    }
   }
 }
+
+void rpmCalc(){
+
+  if(debug && turn !=  1){
+    Serial.println("");
+    Serial.println("--------------------------------------- Calculate RPM");
+    turn = 1;
+  }
+
+  if(count_timerpulse == 0){
+    timerAlarmEnable(timer0); // Ativa a iterrupção do timer0 para contagem de 1 seg
+    attachInterrupt(PULSE, ExternalInterrupt_ISR, FALLING);
+  }
+
+  if (count_timerpulse >= MULTIPLY_FOR_1SEC)
+  {
+    detachInterrupt(PULSE);
+    timerAlarmDisable(timer0);
+
+    if (debug == true){
+      Serial.print("Pulse per seconds: ");
+      Serial.println(count_pulse);
+    }
+
+    count_pulse = (count_pulse / 7); // divide pelo numero de pás
+    rpm = (count_pulse * 60); // multiplica pela quantidade de minutos
+
+    if (debug == true){
+      Serial.print("RPM: ");
+      Serial.println(rpm);
+    }
+
+    count_timerpulse = 0;
+    turn = 0;
+    CurrentState = read_temperature;
+  }
+
+}
+
+void checkWifi(){
+
+  if (debug == true){
+    Serial.println("");
+    Serial.println("--------------------------------------- Check WIFI");
+  }
+
+  if (WiFi.status() != WL_CONNECTED){
+    wifiConnect();
+  }
+  else{
+    if(debug){
+      Serial.println("Wi-FI: CONNECTED!");
+    }
+  }
+}
+
+void checkBroker(){
+
+  if (debug == true){
+    Serial.println("");
+    Serial.println("--------------------------------------- Check BROKER");
+  }
+
+
+  if (!client.state()){ 
+
+    if (debug == true){
+      Serial.println("Broker: CONNECTED!");
+      CurrentState = send_data;
+    }
+  }
+  else {
+    brokerConnect();
+    if (!client.state()){
+      CurrentState = send_data;
+    }
+    else{
+      CurrentState = save_data;
+    }
+  }
+}
+
+void eepromWrite(){
+
+  if(debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Register in EEPROM");
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  if(address >= MAX_KB_MEMORY){
+    CurrentState = waiting_for_time;
+  }
+  else{
+
+  EEPROM.writeInt(address, device);
+  address += sizeof(device);
+
+  if(debug){
+    Serial.print("device: ");
+    Serial.println(device);
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.writeFloat(address, current);
+  address += sizeof(current);
+
+  if(debug){
+    Serial.print("current: ");
+    Serial.println(current);
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.writeInt(address, rpm);
+  address += sizeof(rpm);
+
+  if(debug){
+    Serial.print("rpm: ");
+    Serial.println(rpm);
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.writeFloat(address, temperature);
+  address += sizeof(temperature); 
+
+  if(debug){
+    Serial.print("temperature: ");
+    Serial.println(temperature);
+    Serial.print("address: ");
+    Serial.println(address);
+  }   
+
+  EEPROM.writeULong(address, epochTime);
+  address += sizeof(epochTime);  
+
+  if(debug){
+    Serial.print("epochTime: ");
+    Serial.println(epochTime);
+    Serial.print("address: ");
+    Serial.println(address);
+  }    
+
+  EEPROM.writeFloat(address, humidity_room);
+  address += sizeof(humidity_room); 
+
+  if(debug){
+    Serial.print("humidity_room: ");
+    Serial.println(humidity_room);
+    Serial.print("address: ");
+    Serial.println(address);
+  }    
+
+  EEPROM.writeFloat(address, temperature_room);
+  address += sizeof(temperature_room);
+
+  if(debug){
+    Serial.print("temperature_room: ");
+    Serial.println(temperature_room);
+    Serial.print("address: ");
+    Serial.println(address);
+  }             
+
+  EEPROM.commit();
+
+  CurrentState = waiting_for_time;
+
+  }
+}
+
+void waitingTime(){
+
+  if(cont_time_waiting >= TIME_WAIT){
+    cont_time_waiting = 0;
+    CurrentState = waiting_word_day;
+  }
+
+  if(cont_check_station_control == TIME_CHECK_CONTROL){
+    cont_check_station_control = 0;
+    stationControl();
+  }
+}
+
+void readEpoch(){
+
+  epochTime = getTime();
+
+  if(debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Register in EEPROM");
+    Serial.print("readEpoch: ");
+    Serial.print(epochTime);
+  }
+
+  CurrentState = check_connections;
+}
+
+void eepromRead(){
+
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Read EEPROM");
+  }
+
+  EEPROM.get(address, temperature_room);
+  address -= sizeof(temperature_room);
+
+  if(debug){
+    Serial.print("temperature_room: ");
+    Serial.println(temperature_room);
+    Serial.print("address: ");
+    Serial.println(address);
+  }  
+
+  EEPROM.get(address, humidity_room);
+  address -= sizeof(humidity_room);  
+
+  if(debug){
+    Serial.print("humidity_room: ");
+    Serial.println(humidity_room);
+    Serial.print("address: ");
+    Serial.println(address);
+  }    
+
+  EEPROM.get(address, epochTime);
+  address -= sizeof(epochTime);
+
+  if(debug){
+    Serial.print("epochTime: ");
+    Serial.println(epochTime);
+    Serial.print("address: ");
+    Serial.println(address);
+  }   
+
+  EEPROM.get(address, temperature);
+  address -= sizeof(temperature); 
+
+  if(debug){
+    Serial.print("temperature: ");
+    Serial.println(temperature);
+    Serial.print("address: ");
+    Serial.println(address);
+  }  
+
+  EEPROM.get(address, rpm);
+  address -= sizeof(rpm);    
+
+  if(debug){
+    Serial.print("rpm: ");
+    Serial.println(rpm);
+    Serial.print("address: ");
+    Serial.println(address);
+  }   
+
+  EEPROM.get(address, current);
+  address -= sizeof(current); 
+
+  if(debug){
+    Serial.print("current: ");
+    Serial.println(current);
+    Serial.print("address: ");
+    Serial.println(address);
+  }  
+
+  EEPROM.get(address, device);
+  address -= sizeof(device); 
+
+  if(debug){
+    Serial.print("device: ");
+    Serial.println(device);
+    Serial.print("address: ");
+    Serial.println(address);
+  }   
+}
+
+void stationControl(){
+
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Station Control");
+  }
+
+  if(cont_time_cycle >= TIME_CYCLE){
+
+    digitalWrite(RELE_1, !digitalRead(RELE_1));
+    digitalWrite(RELE_2, !digitalRead(RELE_2));
+    cont_time_cycle = 0;
+  }
+
+  if(debug){
+    Serial.print("cont_time_cycle: ");
+    Serial.println(cont_time_cycle);
+    Serial.println("");
+    Serial.print("RELE_1: ");
+    Serial.println(digitalRead(RELE_1));
+    Serial.print("RELE_2: ");
+    Serial.println(digitalRead(RELE_2));
+  }
+}
+
+int checkDayOfWork(){
+
+  int work = 0;
+  int year = 0;
+
+  getTime();
+
+  if(debug){
+
+    Serial.println("");
+    Serial.println("--------------------------------------- Check Day Of Work");
+  
+    Serial.print("Hour: ");
+    Serial.print(timeinfo.tm_hour);
+    Serial.print(":");  
+    Serial.print(timeinfo.tm_min);
+    Serial.print(":"); 
+    Serial.println(timeinfo.tm_sec);
+
+    Serial.print("");  
+    Serial.print("day week: ");
+    Serial.println(timeinfo.tm_wday); 
+
+    Serial.print("");  
+    Serial.print("Date: ");
+    Serial.print(timeinfo.tm_mday);  
+    Serial.print("/"); 
+    Serial.print(timeinfo.tm_mon); 
+    Serial.print("/"); 
+    year = timeinfo.tm_year + 1900;
+    Serial.println(year);  
+  }
+
+  if((timeinfo.tm_wday >= 1) && (timeinfo.tm_wday <= 5)){
+
+    if((timeinfo.tm_hour >= 8) && (timeinfo.tm_hour < 17)){
+    
+      work = 1;  
+    }
+    else{
+      work = 0;
+    }
+  }
+  else{
+    work = 0;
+  }
+  
+  if(work){
+    CurrentState = read_eltric_current;
+  }
+  else{
+    CurrentState = waiting_word_day;
+    checkShutdown();
+  }
+
+  return work;
+}
+
+void initIOs(){
+
+  digitalWrite(RELE_1, HIGH);
+  digitalWrite(RELE_2, LOW);
+}
+
+void checkShutdown(){
+
+  if(digitalRead(RELE_1) || digitalRead(RELE_2)){
+
+    digitalWrite(RELE_1, LOW);
+    digitalWrite(RELE_2, LOW);
+  }
+}
+
+
