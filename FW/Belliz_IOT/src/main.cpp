@@ -1,3 +1,7 @@
+
+// Implementação OTA 10/01/24
+
+
 ////////////////////////////// BIBLIOTECAS /////////////////////////////////////////////
 
 #include <Arduino.h>
@@ -15,18 +19,26 @@
 #include "DHT.h"
 #include <Adafruit_Sensor.h>
 
+#include "Update.h"
+#include "HTTPClient.h"
+
+
+
+//#include "HttpsOTAUpdate.h"
+
+
 ////////////////////////////// MAPEAMENTO DE HARWARE //////////////////////////////////
 
 #define PULSE 26
 #define SCK_MAX6675 25
 #define CS_MAX6675 33
 #define SO_MAX6675 32
-#define RELE_1 19 // Led RELE_1 = 23
-#define RELE_2 18 // Led RELE_1 = 17
+#define RELE_1 23 // Led RELE_1 = 23
+#define RELE_2 17 // Led RELE_1 = 17
 #define DHTPIN 4 //PINO DIGITAL UTILIZADO PELO DHT22
 #define GPIO_BUTTON 16
-#define GPIO_LED_VM 23 // Led VM =19
-#define GPIO_LED_VD 17 // Led VD =18
+#define GPIO_LED_VM 19 // Led VM =19
+#define GPIO_LED_VD 18 // Led VD =18
 
  // GPIO 34 = ADC1_CHANNEL_6 (BUFFER_ACS712)
 
@@ -44,9 +56,9 @@
 #define MULTIPLY_FOR_1SEC 602
 #define TIME_WAIT 10 // 10 segundos
 #define TIME_CHECK_CONTROL 1 // Verificar a cada 1 segundo
-#define MAX_KB_MEMORY 5040 // 180 registros de 28KB (cada linha de registro possui 28KB)
+#define MAX_KB_MEMORY 4000 // 180 registros de 28KB (cada linha de registro possui 28KB)
 #define TIMER_INTERVAL_US 1000000
-#define TIME_CYCLE 900 // 900seg = 15 min
+#define TIME_CYCLE 5 // 900seg = 15 min
 
 /////////////////////////////// DECLARAÇÃO DE VARIÁVEIS /////////////////////////
 
@@ -69,11 +81,14 @@ bool flag_timer = false,
      wifi_flag = false,
      state_relay = false,
      debug = true;
+
+bool status_platform = true;
      
 int count_pulse = 0,
     count_timerpulse = 0, 
     amostras_index = 0,
     address = 0,
+    address_version_fw = 4001,
     rpm = 0,
     turn = 0,
     cont_time_cycle = 0,
@@ -99,6 +114,11 @@ char messages[110];
 char mac_address [13];
 
 char mac_not_pointers [13];
+
+char topic_sub [20]; 
+char topic_sonoff [20];
+
+bool comand_upload = false;
 
 String mac = "";
 
@@ -127,10 +147,25 @@ enum MachineStates{
   send_data,
   save_data,
   waiting_for_time,
-  waiting_word_day
+  waiting_work_day
 };
 
 MachineStates CurrentState;
+
+// URL do arquivo .txt a ser baixado
+String url_txt = "http://192.168.86.202:5000/firmware/txt.txt";
+String url_firmware = "http://192.168.86.202:5000/firmware/firmware.bin";
+
+String version_fw = "1.0";
+float last_version_fw = 1.0;
+  
+HTTPClient http;
+
+const int MAX_LINES = 5; // Número máximo de linhas que você espera no arquivo
+
+String linhas[MAX_LINES]; // Array para armazenar as linhas do arquivo
+
+RTC_DATA_ATTR int bootCount = 0;
 
 /////////////////////////////// PROTÓTIPOS DE FUNÇÕES /////////////////////////////////////
 
@@ -213,6 +248,22 @@ void initIOs();
 // Função para verificar se os relés estão desligados 
 void checkShutdown();
 
+// Função para ler arquivo de texto e extrair a informações em linhas. Primeira linha URL download FW, segunda linha versão do firmware.
+void getTxt();
+
+// Função para atualizar o fw via OTA
+void updateFirmware();
+
+// Função para verificação de caracteres não impressos
+bool hasNonPrintableCharacters(const String& str);
+
+// Função para remover caracteres não impressos
+void removeNonPrintableCharacters(String& str);
+
+void callback(char* topic, byte* message, unsigned int length);
+void reconnect();
+
+
 /////////////////////////////// FUNÇÕES DE CALLBACK ///////////////////////////////////
 
 void IRAM_ATTR ExternalInterrupt_ISR(){ // Interrupção externa para contagem de pulsos do cooler
@@ -241,6 +292,59 @@ void IRAM_ATTR Timer1_ISR() { // Interrupção a cada 1seg para contagem de temp
   }
 }
 
+void callback(char* topic, byte* payload, unsigned int length) {
+  if(debug){
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  Serial.println();
+  //for (int i = 0; i < length; i++) {
+    Serial.print("[ ");
+    Serial.print((char)payload[0]);
+    Serial.print(" ]");
+ // }
+  Serial.println();
+  }
+
+  // Switch on the LED if an 1 was received as first character 
+  if(strcmp(topic, topic_sub) == 0){
+  if ((char)payload[0] == '1') {
+    if(debug)
+    Serial.println("ON");
+    comand_upload = true;
+    //digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
+    // but actually the LED is on; this is because
+    // it is active low on the ESP-01)
+  } else if ((char)payload[0] == '0'){
+    if(debug)
+    Serial.println("OFF");
+    comand_upload = false;
+    //digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
+  }
+  }
+if(strcmp(topic, topic_sonoff) == 0){
+    if ((char)payload[0] == '1') {
+    if(debug)
+    Serial.println("LIGA");
+    status_platform = true;
+    //digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
+    // but actually the LED is on; this is because
+    // it is active low on the ESP-01)
+  } else if ((char)payload[0] == '0'){
+    if(debug)
+    Serial.println("DESLIGA");
+    status_platform = false;
+    digitalWrite(RELE_1, LOW);
+    digitalWrite(RELE_2, LOW);
+    //digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
+  }
+
+}
+
+//for(int i=0;i<length;i++)payload[i]='0';
+ memset(&payload,0, 1); // "Limpa a sujeira o coteúdo"
+
+}
 
 ////////////////// FUNÇÕES PRINCIPAIS DO FRAMEWORK DO ARDUINO /////////////////////////
 
@@ -251,10 +355,34 @@ void setup() {
 
   Serial.begin(BAUD_RATE_SERIAL);
 
+  esp_reset_reason_t reason = esp_reset_reason();
+  
+  switch (reason) {
+    case ESP_RST_POWERON:
+      if(debug)
+        Serial.println("Reinício após falha de energia (PWRON)");
+        EEPROM.writeFloat(address_version_fw, 1.0);
+        EEPROM.commit();
+        break;
+    case ESP_RST_EXT:
+      if(debug)
+        Serial.println("Reinício externo (EXT)");
+        break;
+    case ESP_RST_SW:
+      if(debug)
+        Serial.println("Reinício por software (SW)");
+        break;
+    // Outros casos possíveis...
+    default:
+      if(debug)
+        Serial.println("Motivo de reinício desconhecido");
+        break;
+  }
+
   wifiConnect();
 
-  client.setServer(broker, BROKER_PORT); // Função para definição de Broker mqtt e porta
-
+  getMAC();
+  
   brokerConnect();
 
   Wire.begin(); //Esta biblioteca permite a comunicação com dispositivos I2C.
@@ -267,24 +395,36 @@ void setup() {
 
   updateEpoch();
 
-  getMAC();
-
   dht.begin();
 
   device = selectModeDevice();
 
-  EEPROM.begin(512);
+  EEPROM.begin(4096);
+
+  EEPROM.get(address_version_fw, last_version_fw);
+
+  if(debug){
+  Serial.print("last_version_fw");
+  Serial.println(last_version_fw);
+  }
 
   if(checkDayOfWork()){
     initIOs();
     CurrentState = read_eltric_current;
   }
   else{
-    CurrentState = waiting_word_day;
+    CurrentState = waiting_work_day;
   }
+
 }
 
 void loop(){
+
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
   executeMachineState();
 }
 
@@ -331,9 +471,11 @@ void executeMachineState(){
     waitingTime();
     break;
 
-  case waiting_word_day:
+  case waiting_work_day:
     checkDayOfWork();
     break;
+
+
   }
 }
 
@@ -451,7 +593,36 @@ void brokerConnect(){
     Serial.println(broker);
   }
 
-  client.connect("", brokerUser, brokerPass);
+  client.setServer(broker, BROKER_PORT); // Função para definição de Broker mqtt e porta
+  client.setCallback(callback);
+  //client.subscribe("ravani/button",0);
+
+  strcpy(topic_sub, mac_not_pointers); // Copia mac_not_pointers para topic_sub
+  strcat(topic_sub, "/fw"); // Concatena "/fw" a topic_sub
+
+  strcpy(topic_sonoff, mac_not_pointers); // Copia mac_not_pointers para topic_sub
+  strcat(topic_sonoff, "/status"); // Concatena "/fw" a topic_sub
+
+  //client.subscribe(topic_sub,2);
+  //client.subscribe("C8F09E9FB098/fw",2);
+
+  Serial.print("Topic Subscribe: ");
+  Serial.println(topic_sub);
+  Serial.print("Topic Subscribe: ");
+  Serial.println(topic_sonoff);
+
+      if (client.connect("TestClient","Default","a9232c2f-d3ec-4bfc-a382-82c9c29808ba")) {
+      Serial.println("connected");
+      // Subscribe
+      client.subscribe(topic_sub,0);
+      client.subscribe(topic_sonoff,0);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
 
   if (!client.state()){ 
   
@@ -507,6 +678,8 @@ void wifiConnect(){
       Serial.println("W-Fi: Fail in conection! ");
       Serial.print("Wi-FI state: ");
       Serial.println(WiFi.status());
+      Serial.print("IP obtido: ");
+      Serial.println(WiFi.localIP());
     }
   }
   else{
@@ -571,7 +744,7 @@ void sendData(){
     Serial.println("");
   }
 
-  snprintf(messages, 110, "{\"device\":%d,\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"temp_room\":%.2f, \"humidity_room\":%.2f}", device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
+  snprintf(messages, 110, "{\"device\":%d,\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"humidity_room\":%.2f, \"temp_room\":%.2f}", device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
   client.publish(outTopic, messages);
     
   if(debug){
@@ -821,13 +994,18 @@ void waitingTime(){
 
   if(cont_time_waiting >= TIME_WAIT){
     cont_time_waiting = 0;
-    CurrentState = waiting_word_day;
+    CurrentState = waiting_work_day;
   }
 
   if(cont_check_station_control == TIME_CHECK_CONTROL){
     cont_check_station_control = 0;
     stationControl();
   }
+  if (comand_upload){
+      comand_upload = false;
+      getTxt();
+  }
+
 }
 
 void readEpoch(){
@@ -929,11 +1107,12 @@ void stationControl(){
     Serial.println("--------------------------------------- Station Control");
   }
 
-  if(cont_time_cycle >= TIME_CYCLE){
+  if(cont_time_cycle >= TIME_CYCLE && status_platform){
 
+    cont_time_cycle = 0;
     digitalWrite(RELE_1, !digitalRead(RELE_1));
     digitalWrite(RELE_2, !digitalRead(RELE_2));
-    cont_time_cycle = 0;
+    
   }
 
   if(debug){
@@ -995,10 +1174,11 @@ int checkDayOfWork(){
   }
   
   if(work){
+    initIOs();
     CurrentState = read_eltric_current;
   }
   else{
-    CurrentState = waiting_word_day;
+    CurrentState = waiting_work_day;
     checkShutdown();
   }
 
@@ -1007,8 +1187,11 @@ int checkDayOfWork(){
 
 void initIOs(){
 
-  digitalWrite(RELE_1, HIGH);
-  digitalWrite(RELE_2, LOW);
+  if(status_platform){
+    digitalWrite(RELE_1, HIGH);
+    digitalWrite(RELE_2, LOW);
+  }
+
 }
 
 void checkShutdown(){
@@ -1017,6 +1200,176 @@ void checkShutdown(){
 
     digitalWrite(RELE_1, LOW);
     digitalWrite(RELE_2, LOW);
+  }
+}
+
+void getTxt(){
+
+  float version_fw_float;
+
+  http.begin(url_txt);
+  
+  int httpCode = http.GET();
+  
+  if (httpCode > 0) {
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      if(debug){
+        Serial.println("Conteudo do arquivo:");
+        Serial.println(payload); // Exibe o conteúdo completo do arquivo .txt
+      }
+      // Processar o conteúdo do arquivo linha por linha
+      int inicio = 0;
+      int posicao = 0;
+      int contador = 1; // Iniciando de 1 para corresponder à primeira linha
+      
+      while (posicao < payload.length()) {
+        posicao = payload.indexOf('\n', inicio);
+        
+        if (posicao == -1) {
+          posicao = payload.length(); // Se for a última linha, usar o comprimento total do payload
+        }
+        
+        linhas[contador] = payload.substring(inicio, posicao);
+        inicio = posicao + 1;
+        contador++;
+     }
+        if(debug){
+          for (int i = 1; i < contador; i++) {
+            Serial.print("Linha ");
+            Serial.print(i);
+            Serial.print(": ");
+            Serial.println(linhas[i]);
+          }
+        }
+
+      url_firmware = linhas[1];
+      version_fw = linhas[2];
+
+      if (hasNonPrintableCharacters(url_firmware)) {
+        if(debug)
+        Serial.println("A String has non-printable characters.");
+        removeNonPrintableCharacters(url_firmware);
+      } 
+      else {
+        if(debug)
+        Serial.println("The String is OK, it has no unprintable characters.");
+      }
+
+
+      version_fw_float = version_fw.toFloat();
+
+
+    }
+  } else {
+    if(debug)
+    Serial.println("Erro ao baixar o arquivo.");
+  }
+  http.end();
+
+  Serial.println("version_fw_float:");
+  Serial.println(version_fw_float);
+
+  Serial.println("last_version_fw:");
+  Serial.println(last_version_fw);
+
+  if (version_fw_float > last_version_fw){
+
+    last_version_fw = version_fw_float;
+
+    EEPROM.writeFloat(address_version_fw, last_version_fw);
+    EEPROM.commit();
+
+    updateFirmware();
+  }
+}
+
+void updateFirmware() {
+  // Start pulling down the firmware binary.
+  if(debug)
+  Serial.println("-------------------------------------------------Update Firmeware");
+
+  http.begin(url_firmware);
+  int httpCode = http.GET();
+  if (httpCode <= 0) {
+    if(debug)
+    Serial.printf("HTTP failed, error: %s\n", 
+       http.errorToString(httpCode).c_str());
+    return;
+  }
+  // Check that we have enough space for the new binary.
+  int contentLen = http.getSize();
+  if(debug)
+  Serial.printf("Content-Length: %d\n", contentLen);
+  bool canBegin = Update.begin(contentLen);
+  if (!canBegin) {
+    if(debug)
+    Serial.println("Not enough space to begin OTA");
+    return;
+  }
+  // Write the HTTP stream to the Update library.
+  WiFiClient* client = http.getStreamPtr();
+  size_t written = Update.writeStream(*client);
+  Serial.printf("OTA: %d/%d bytes written.\n", written, contentLen);
+  if (written != contentLen) {
+    if(debug)
+    Serial.println("Wrote partial binary. Giving up.");
+    return;
+  }
+  if (!Update.end()) {
+    if(debug)
+    Serial.println("Error from Update.end(): " + 
+      String(Update.getError()));
+    return;
+  }
+  if (Update.isFinished()) {
+    if(debug)
+    Serial.println("Update successfully completed. Rebooting."); 
+    // This line is specific to the ESP32 platform:
+    ESP.restart();
+  } else {
+    if(debug)
+    Serial.println("Error from Update.isFinished(): " + 
+      String(Update.getError()));
+    return;
+  }
+}
+
+bool hasNonPrintableCharacters(const String& str) {
+    for (size_t i = 0; i < str.length(); ++i) {
+        if (!isprint(str[i])) {
+            return true; // Encontrou um caractere não imprimível
+        }
+    }
+    return false; // Não há caracteres não imprimíveis na String
+}
+
+void removeNonPrintableCharacters(String& str) {
+    for (size_t i = 0; i < str.length(); ++i) {
+        if (!isprint(str[i])) {
+            str.remove(i, 1); // Remove o caractere não imprimível
+            i--; // Ajusta o índice após a remoção
+        }
+    }
+}
+
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect("TestClient","Default","a9232c2f-d3ec-4bfc-a382-82c9c29808ba")) {
+      Serial.println("connected");
+      // Subscribe
+      client.subscribe(topic_sub,0);
+      client.subscribe(topic_sonoff,0);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
   }
 }
 
