@@ -39,6 +39,7 @@
 #define GPIO_BUTTON 16
 #define GPIO_LED_VM 19 // Led VM =19
 #define GPIO_LED_VD 18 // Led VD =18
+#define DETECTOR_FIRE 39
 
  // GPIO 34 = ADC1_CHANNEL_6 (BUFFER_ACS712)
 
@@ -58,7 +59,12 @@
 #define TIME_CHECK_CONTROL 1 // Verificar a cada 1 segundo
 #define MAX_KB_MEMORY 4000 // 180 registros de 28KB (cada linha de registro possui 28KB)
 #define TIMER_INTERVAL_US 1000000
-#define TIME_CYCLE 5 // 900seg = 15 min
+#define TIME_CYCLE 900 // 900seg = 15 min
+#define HOUR_INIT_WORK 8 
+#define HOUR_FINISH_WORK 17
+#define DAY_WEEK_INIT_WORK 1
+#define DAY_WEEK_FINISH_WORK 5
+#define ONE_HOUR_IN_SECONDS 8 // 3600 = 1 hora
 
 /////////////////////////////// DECLARAÇÃO DE VARIÁVEIS /////////////////////////
 
@@ -68,8 +74,8 @@ const long gmtOffset_sec = (-3 * 3600);
 const int daylightOffset_sec = 3600;
 
 // WIFI
-const char *ssid = "WIFI_MESH_IST";
-const char *password = "ac1ce0ss6_mesh";
+const char *ssid = "WIFI_MESH_IST"; //WIFI_MESH_IST   ravani
+const char *password = "ac1ce0ss6_mesh"; //ac1ce0ss6_mesh   senaipos123
 
 // CLIENT MQTT
 const char *brokerUser = "Default";
@@ -82,7 +88,7 @@ bool flag_timer = false,
      state_relay = false,
      debug = true;
 
-bool status_platform = true;
+bool status_platform = true; // Flag indicativa de acionamento ou desligamento via protocolo mqtt
      
 int count_pulse = 0,
     count_timerpulse = 0, 
@@ -99,6 +105,15 @@ int count_pulse = 0,
 // Master = 0 | Slave = 1
 int device = 0;
 
+int year = 0;
+
+unsigned int cont_hour = 0;
+
+unsigned long int invert_1s = 0;
+
+bool last_work = false; 
+bool work = false;
+
 float temperature = 0,
       amostras[MAX + 1],
       rms = 0,
@@ -109,7 +124,9 @@ float temperature = 0,
 unsigned long epochTime = 0,
               last_millis_cycle = 0;     
 
-char messages[110];
+
+
+char messages[125];
 
 char mac_address [13];
 
@@ -138,7 +155,9 @@ MAX6675 temp(SCK_MAX6675, CS_MAX6675, SO_MAX6675);
 DHT dht(DHTPIN, DHTTYPE);
 
 enum MachineStates{
-  read_eltric_current = 0,
+
+  initialization =  0,
+  read_eltric_current,
   read_rpm,
   read_temperature,
   read_temp_humidity_romm,
@@ -146,8 +165,7 @@ enum MachineStates{
   check_connections,
   send_data,
   save_data,
-  waiting_for_time,
-  waiting_work_day
+  waiting_for_time
 };
 
 MachineStates CurrentState;
@@ -223,12 +241,6 @@ void checkBroker();
 // Função para gravar as informações na memória EEPROM 
 void eepromWrite();
 
-// Função para escrita na memória EEPROM
-void eepromWrite();
-
-// Função para aguardar o tempo de ciclo 
-void waitingTime();
-
 // Função para realizar a leitura da memória Flash "EEPROM"
 void eepromRead();
 
@@ -240,7 +252,7 @@ void stationControl();
 
 // Função para controlar o dia de trabalho da estação
 // 1 = Dia de trabalho | 0 = Folga 
-int checkDayOfWork();
+void checkDayOfWork();
 
 // Função para definir o estado atual dos periféricos
 void initIOs();
@@ -284,11 +296,16 @@ void IRAM_ATTR Timer0_ISR(){ // Tempo de estouro a cada 1,6ms
 
 void IRAM_ATTR Timer1_ISR() { // Interrupção a cada 1seg para contagem de tempo
 
-  cont_time_cycle ++; 
+ invert_1s ++;
+ cont_hour ++;
 
-  if(CurrentState == waiting_for_time){
+  if(work){
+    cont_time_cycle ++; 
     cont_time_waiting ++;
-    cont_check_station_control ++;
+
+    if(device == 0){  
+      cont_check_station_control ++;
+    }
   }
 }
 
@@ -352,8 +369,16 @@ void setup() {
 
   pinMode(RELE_1, OUTPUT);
   pinMode(RELE_2, OUTPUT);
+  pinMode(GPIO_LED_VM, OUTPUT);
+  pinMode(GPIO_LED_VD, OUTPUT);
+  pinMode(DETECTOR_FIRE, INPUT);
+
+  digitalWrite(GPIO_LED_VM, LOW);
+  digitalWrite(GPIO_LED_VD, LOW);
 
   Serial.begin(BAUD_RATE_SERIAL);
+
+  EEPROM.begin(4096);
 
   esp_reset_reason_t reason = esp_reset_reason();
   
@@ -399,8 +424,6 @@ void setup() {
 
   device = selectModeDevice();
 
-  EEPROM.begin(4096);
-
   EEPROM.get(address_version_fw, last_version_fw);
 
   if(debug){
@@ -408,13 +431,7 @@ void setup() {
   Serial.println(last_version_fw);
   }
 
-  if(checkDayOfWork()){
-    initIOs();
-    CurrentState = read_eltric_current;
-  }
-  else{
-    CurrentState = waiting_work_day;
-  }
+  checkDayOfWork();
 
 }
 
@@ -433,6 +450,10 @@ void loop(){
 void executeMachineState(){
 
   switch (CurrentState){
+
+  case initialization:
+    initIOs();
+    break;
 
   case read_eltric_current:
     currentEletricCalc();
@@ -468,13 +489,8 @@ void executeMachineState(){
     break;
   
   case waiting_for_time:
-    waitingTime();
-    break;
-
-  case waiting_work_day:
     checkDayOfWork();
     break;
-
 
   }
 }
@@ -633,8 +649,10 @@ void brokerConnect(){
   else {
     if (debug == true){
       Serial.println("Broker: Fail in conection! ");
+      digitalWrite(GPIO_LED_VD, LOW);
       Serial.print("Broker state: ");
       Serial.println(client.state());
+      
     }
   }
 }
@@ -663,7 +681,7 @@ void wifiConnect(){
 
   WiFi.begin(ssid, password);
 
-  while((i <= 10) && (WiFi.status() != WL_CONNECTED)){
+  while((i <= 30) && (WiFi.status() != WL_CONNECTED)){
 
     if (debug == true){
       Serial.print(".");
@@ -744,7 +762,7 @@ void sendData(){
     Serial.println("");
   }
 
-  snprintf(messages, 110, "{\"device\":%d,\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"humidity_room\":%.2f, \"temp_room\":%.2f}", device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
+  snprintf(messages, 125, "{\"fw\":%.2f,\"device\":%d,\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"humidity_room\":%.2f, \"temp_room\":%.2f}", last_version_fw, device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
   client.publish(outTopic, messages);
     
   if(debug){
@@ -758,6 +776,7 @@ void sendData(){
   }
 
   if (address == 0){
+
     CurrentState = waiting_for_time;
   }
   
@@ -885,10 +904,13 @@ void checkBroker(){
 
     if (debug == true){
       Serial.println("Broker: CONNECTED!");
+      digitalWrite(GPIO_LED_VD, HIGH);
+ 
       CurrentState = send_data;
     }
   }
   else {
+    digitalWrite(GPIO_LED_VD, HIGH);
     brokerConnect();
     if (!client.state()){
       CurrentState = send_data;
@@ -919,6 +941,7 @@ void eepromWrite(){
   if(debug){
     Serial.print("device: ");
     Serial.println(device);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }
@@ -929,6 +952,7 @@ void eepromWrite(){
   if(debug){
     Serial.print("current: ");
     Serial.println(current);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }
@@ -939,6 +963,7 @@ void eepromWrite(){
   if(debug){
     Serial.print("rpm: ");
     Serial.println(rpm);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }
@@ -949,6 +974,7 @@ void eepromWrite(){
   if(debug){
     Serial.print("temperature: ");
     Serial.println(temperature);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }   
@@ -959,6 +985,7 @@ void eepromWrite(){
   if(debug){
     Serial.print("epochTime: ");
     Serial.println(epochTime);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }    
@@ -969,16 +996,17 @@ void eepromWrite(){
   if(debug){
     Serial.print("humidity_room: ");
     Serial.println(humidity_room);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }    
 
   EEPROM.writeFloat(address, temperature_room);
-  address += sizeof(temperature_room);
 
   if(debug){
     Serial.print("temperature_room: ");
     Serial.println(temperature_room);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }             
@@ -990,31 +1018,13 @@ void eepromWrite(){
   }
 }
 
-void waitingTime(){
-
-  if(cont_time_waiting >= TIME_WAIT){
-    cont_time_waiting = 0;
-    CurrentState = waiting_work_day;
-  }
-
-  if(cont_check_station_control == TIME_CHECK_CONTROL){
-    cont_check_station_control = 0;
-    stationControl();
-  }
-  if (comand_upload){
-      comand_upload = false;
-      getTxt();
-  }
-
-}
-
 void readEpoch(){
 
   epochTime = getTime();
 
   if(debug){
     Serial.println("");
-    Serial.println("--------------------------------------- Register in EEPROM");
+    Serial.println("--------------------------------------- ReadEpoch");
     Serial.print("readEpoch: ");
     Serial.print(epochTime);
   }
@@ -1027,74 +1037,83 @@ void eepromRead(){
   if (debug){
     Serial.println("");
     Serial.println("--------------------------------------- Read EEPROM");
+    Serial.print("address: ");
+    Serial.println(address);
   }
 
   EEPROM.get(address, temperature_room);
-  address -= sizeof(temperature_room);
+  
 
   if(debug){
     Serial.print("temperature_room: ");
     Serial.println(temperature_room);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }  
 
+  address -= sizeof(temperature_room); 
   EEPROM.get(address, humidity_room);
-  address -= sizeof(humidity_room);  
-
+  
   if(debug){
     Serial.print("humidity_room: ");
     Serial.println(humidity_room);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }    
-
+  address -= sizeof(humidity_room); 
   EEPROM.get(address, epochTime);
-  address -= sizeof(epochTime);
 
   if(debug){
     Serial.print("epochTime: ");
     Serial.println(epochTime);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }   
 
+  address -= sizeof(epochTime);
+  
   EEPROM.get(address, temperature);
-  address -= sizeof(temperature); 
 
   if(debug){
     Serial.print("temperature: ");
     Serial.println(temperature);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }  
 
-  EEPROM.get(address, rpm);
-  address -= sizeof(rpm);    
+  address -= sizeof(temperature); 
+  EEPROM.get(address, rpm); 
 
   if(debug){
     Serial.print("rpm: ");
     Serial.println(rpm);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }   
 
+  address -= sizeof(rpm); 
   EEPROM.get(address, current);
-  address -= sizeof(current); 
 
   if(debug){
     Serial.print("current: ");
     Serial.println(current);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }  
 
+  address -= sizeof(current); 
   EEPROM.get(address, device);
-  address -= sizeof(device); 
 
   if(debug){
     Serial.print("device: ");
     Serial.println(device);
+    Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }   
@@ -1126,71 +1145,130 @@ void stationControl(){
   }
 }
 
-int checkDayOfWork(){
+void checkDayOfWork(){
 
-  int work = 0;
-  int year = 0;
+  if(invert_1s >= 1){
 
-  getTime();
+    invert_1s = 0;
 
-  if(debug){
+    getTime();
 
-    Serial.println("");
-    Serial.println("--------------------------------------- Check Day Of Work");
-  
-    Serial.print("Hour: ");
-    Serial.print(timeinfo.tm_hour);
-    Serial.print(":");  
-    Serial.print(timeinfo.tm_min);
-    Serial.print(":"); 
-    Serial.println(timeinfo.tm_sec);
+    if(debug){
 
-    Serial.print("");  
-    Serial.print("day week: ");
-    Serial.println(timeinfo.tm_wday); 
-
-    Serial.print("");  
-    Serial.print("Date: ");
-    Serial.print(timeinfo.tm_mday);  
-    Serial.print("/"); 
-    Serial.print(timeinfo.tm_mon); 
-    Serial.print("/"); 
-    year = timeinfo.tm_year + 1900;
-    Serial.println(year);  
-  }
-
-  if((timeinfo.tm_wday >= 1) && (timeinfo.tm_wday <= 5)){
-
-    if((timeinfo.tm_hour >= 8) && (timeinfo.tm_hour < 17)){
+      Serial.println("");
+      Serial.println("--------------------------------------- Check Day Of Work");
     
-      work = 1;  
+      Serial.print("Hour: ");
+      Serial.print(timeinfo.tm_hour);
+      Serial.print(":");  
+      Serial.print(timeinfo.tm_min);
+      Serial.print(":"); 
+      Serial.println(timeinfo.tm_sec);
+
+      Serial.print("");  
+      Serial.print("day week: ");
+      Serial.println(timeinfo.tm_wday); 
+
+      Serial.print("");  
+      Serial.print("Date: ");
+      Serial.print(timeinfo.tm_mday);  
+      Serial.print("/"); 
+      Serial.print(timeinfo.tm_mon); 
+      Serial.print("/"); 
+      year = timeinfo.tm_year + 1900;
+      Serial.println(year);  
+    }
+
+    if((timeinfo.tm_wday >= DAY_WEEK_INIT_WORK) && (timeinfo.tm_wday <= DAY_WEEK_FINISH_WORK)){
+
+      if((timeinfo.tm_hour >= HOUR_INIT_WORK) && (timeinfo.tm_hour < HOUR_FINISH_WORK)){
+      
+        work = true; 
+
+        Serial.println("work = true 1");
+
+      }
+      else{
+        work = false;
+        Serial.println("work = false 1");
+      }
     }
     else{
-      work = 0;
+      work = false;
+      Serial.println("work = false 2");
+    }
+
+
+    if(!last_work && !work){ // Estava desligado e continuará desligado
+      last_work = work;
+      checkWifi();
+      getTime();
+
+
+      CurrentState = waiting_for_time;
+    }
+
+    if(!last_work && work){ // Estava desligado e irá ligar
+      last_work = work;
+      CurrentState = initialization;
+    }
+
+    if(last_work && !work){ // Estava Ligado e irá desligar
+      last_work = work;
+
+          if(device == 0){ 
+            checkShutdown();
+          }
+
+      CurrentState = waiting_for_time;    
+    }
+
+    if(last_work && work){ //Estava ligado e continuará ligado
+          last_work = work;
+
+          if(cont_time_waiting >= TIME_WAIT){ // Tempo de espera para coleta de dados
+            cont_time_waiting = 0;
+            CurrentState = read_eltric_current; 
+          }
+          if(device == 0){  
+            if(cont_check_station_control >= TIME_CHECK_CONTROL){ // Tempo para verificar o ciclo de 15 min
+              cont_check_station_control = 0;
+              stationControl();
+            }
+          }  
+    }
+
+    if (comand_upload){  // Verificar se teve um comando externo para Upload
+      comand_upload = false;
+      getTxt();
+    }
+
+    if(cont_hour >= ONE_HOUR_IN_SECONDS){
+
+      if (WiFi.status() != WL_CONNECTED){
+        wifiConnect();
+      }
+      else{
+        if(debug){
+          Serial.println("Wi-FI: CONNECTED!");
+          cont_hour = 0;
+          updateEpoch();
+        }
+      }
     }
   }
-  else{
-    work = 0;
-  }
-  
-  if(work){
-    initIOs();
-    CurrentState = read_eltric_current;
-  }
-  else{
-    CurrentState = waiting_work_day;
-    checkShutdown();
-  }
-
-  return work;
 }
 
 void initIOs(){
 
+  Serial.println("--------------------------------------- initIOs");
+
   if(status_platform){
     digitalWrite(RELE_1, HIGH);
-    digitalWrite(RELE_2, LOW);
+    digitalWrite(RELE_2, HIGH);
   }
+
+  CurrentState = read_eltric_current;
 
 }
 
@@ -1277,6 +1355,8 @@ void getTxt(){
 
     last_version_fw = version_fw_float;
 
+    digitalWrite(GPIO_LED_VM, HIGH);
+
     EEPROM.writeFloat(address_version_fw, last_version_fw);
     EEPROM.commit();
 
@@ -1351,11 +1431,15 @@ void removeNonPrintableCharacters(String& str) {
             i--; // Ajusta o índice após a remoção
         }
     }
+
 }
 
 void reconnect() {
+
+  int cont = 0;
+
   // Loop until we're reconnected
-  while (!client.connected()) {
+  while (!client.connected() && cont == 5) {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
     if (client.connect("TestClient","Default","a9232c2f-d3ec-4bfc-a382-82c9c29808ba")) {
@@ -1370,6 +1454,7 @@ void reconnect() {
       // Wait 5 seconds before retrying
       delay(5000);
     }
+    cont ++;
   }
 }
 

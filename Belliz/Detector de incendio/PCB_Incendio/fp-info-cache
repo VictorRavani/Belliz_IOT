@@ -1,4 +1,4 @@
-21726272798960498
+21729681480011997
 Audio_Module
 Reverb_BTDR-1H
 Digital Reverberation Unit, http://www.belton.co.kr/inc/downfile.php?seq=17&file=pdf (footprint from http://www.uk-electronic.de/PDF/BTDR-1.pdf)
@@ -63378,6 +63378,13 @@ Buzzer 9mm
 2
 2
 My_library_footprint
+Buzzer_9,6mm
+CMI-9605-0580T-1
+Loudspeaker or Buzzer
+0
+2
+2
+My_library_footprint
 CAPAE430X550N
 4 × 5.4
 Capacitor Polarised
@@ -63395,6 +63402,13 @@ My_library_footprint
 CAPC2012X88N
 C0805C104K5RAC7411-+-+
 Capacitor
+0
+2
+2
+My_library_footprint
+Capacitor_EEE1AA220WR
+SMD_Lytic_B
+Capacitor Polarised
 0
 2
 2
