@@ -81,7 +81,10 @@ const char *password = "ac1ce0ss6_mesh"; //ac1ce0ss6_mesh   senaipos123
 const char *brokerUser = "Default";
 const char *brokerPass = "a9232c2f-d3ec-4bfc-a382-82c9c29808ba";
 const char *broker = "mqtt.tago.io";
-const char *outTopic = "NULLLLLLLLLL"; 
+const char *outTopic = "C8F09E9F3688";   // Tópico para envio das infomações padrão ({"FW":1.00,"DV":0,"A":0.00,"RPM":0,"TE":23.50, "EPC":1705337333, "HR":72.20, "TR":22.80}). Será o MAC de cada dispositivo. 
+const char *outTopicFire = "fire";       // Tópico para visualização do sensor de incêndio
+const char *outTopicControl = "control"; // Tópico para controle de liga e desliga da plataforma
+const char *outTopicUpOTA = "UpdateOTA"; // Tópico para verificação de nova versão de firmware
 
 bool flag_timer = false,
      wifi_flag = false,
@@ -124,9 +127,10 @@ float temperature = 0,
 unsigned long epochTime = 0,
               last_millis_cycle = 0;     
 
-
+bool fireDetector = false;
 
 char messages[125];
+char messagesSOS[20];
 
 char mac_address [13];
 
@@ -165,7 +169,8 @@ enum MachineStates{
   check_connections,
   send_data,
   save_data,
-  waiting_for_time
+  waiting_for_time,
+  fire_detector
 };
 
 MachineStates CurrentState;
@@ -266,6 +271,9 @@ void getTxt();
 // Função para atualizar o fw via OTA
 void updateFirmware();
 
+//Função para verifiar o sensor de fumaça
+void check_fire();
+
 // Função para verificação de caracteres não impressos
 bool hasNonPrintableCharacters(const String& str);
 
@@ -275,6 +283,11 @@ void removeNonPrintableCharacters(String& str);
 void callback(char* topic, byte* message, unsigned int length);
 void reconnect();
 
+void IRAM_ATTR funcao_ISR();
+
+void sendSos();
+
+void restart();
 
 /////////////////////////////// FUNÇÕES DE CALLBACK ///////////////////////////////////
 
@@ -299,11 +312,11 @@ void IRAM_ATTR Timer1_ISR() { // Interrupção a cada 1seg para contagem de temp
  invert_1s ++;
  cont_hour ++;
 
-  if(work){
+  if(work && !fireDetector){
     cont_time_cycle ++; 
     cont_time_waiting ++;
 
-    if(device == 0){  
+    if((device == 0) && !fireDetector){  
       cont_check_station_control ++;
     }
   }
@@ -324,7 +337,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 
   // Switch on the LED if an 1 was received as first character 
-  if(strcmp(topic, topic_sub) == 0){
+  if(strcmp(topic, outTopicUpOTA) == 0){
   if ((char)payload[0] == '1') {
     if(debug)
     Serial.println("ON");
@@ -339,11 +352,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
     //digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
   }
   }
-if(strcmp(topic, topic_sonoff) == 0){
+if(strcmp(topic, outTopicControl) == 0){
     if ((char)payload[0] == '1') {
     if(debug)
     Serial.println("LIGA");
     status_platform = true;
+    restart();
     //digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
     // but actually the LED is on; this is because
     // it is active low on the ESP-01)
@@ -362,6 +376,20 @@ if(strcmp(topic, topic_sonoff) == 0){
  memset(&payload,0, 1); // "Limpa a sujeira o coteúdo"
 
 }
+
+/* Função ISR (chamada quando há geração da
+interrupção) */
+void IRAM_ATTR funcao_ISR(){
+
+  digitalWrite(RELE_1, LOW);
+  digitalWrite(RELE_2, LOW);
+
+  fireDetector = true;
+
+  CurrentState = fire_detector;
+
+}
+
 
 ////////////////// FUNÇÕES PRINCIPAIS DO FRAMEWORK DO ARDUINO /////////////////////////
 
@@ -433,6 +461,8 @@ void setup() {
 
   checkDayOfWork();
 
+  attachInterrupt(DETECTOR_FIRE, funcao_ISR, RISING);
+
 }
 
 void loop(){
@@ -492,6 +522,9 @@ void executeMachineState(){
     checkDayOfWork();
     break;
 
+  case fire_detector:
+    check_fire();
+    break;  
   }
 }
 
@@ -613,25 +646,22 @@ void brokerConnect(){
   client.setCallback(callback);
   //client.subscribe("ravani/button",0);
 
-  strcpy(topic_sub, mac_not_pointers); // Copia mac_not_pointers para topic_sub
-  strcat(topic_sub, "/fw"); // Concatena "/fw" a topic_sub
-
-  strcpy(topic_sonoff, mac_not_pointers); // Copia mac_not_pointers para topic_sub
-  strcat(topic_sonoff, "/status"); // Concatena "/fw" a topic_sub
+  //strcpy(topic_sub, mac_not_pointers); // Copia mac_not_pointers para topic_sub
+  //strcat(topic_sub, "/fw"); // Concatena "/fw" a topic_sub
 
   //client.subscribe(topic_sub,2);
   //client.subscribe("C8F09E9FB098/fw",2);
 
   Serial.print("Topic Subscribe: ");
-  Serial.println(topic_sub);
+  Serial.println(outTopicUpOTA);
   Serial.print("Topic Subscribe: ");
-  Serial.println(topic_sonoff);
+  Serial.println(outTopicControl);
 
       if (client.connect("TestClient","Default","a9232c2f-d3ec-4bfc-a382-82c9c29808ba")) {
       Serial.println("connected");
       // Subscribe
-      client.subscribe(topic_sub,0);
-      client.subscribe(topic_sonoff,0);
+      client.subscribe(outTopicUpOTA,0);
+      client.subscribe(outTopicControl,0);
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -762,12 +792,33 @@ void sendData(){
     Serial.println("");
   }
 
-  snprintf(messages, 125, "{\"fw\":%.2f,\"device\":%d,\"current\":%.2f,\"rpm\":%d,\"temp\":%.2f, \"epoch\":%d, \"humidity_room\":%.2f, \"temp_room\":%.2f}", last_version_fw, device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
+  /* descrição dos parâmetros:
+
+    FW: Versaõ do firmware
+    DV: Tipo do device -> Master = 0 | Slave = 1
+    A: Corrente 
+    RPM: Rotação por minuto (Vazão)
+    TE: Temperatura do Ar do secador de cabelo
+    EPC: Data em formato Epoch
+    HR: Umidade do ambiente 
+    TR: Temperatura do ambiente
+  */
+
+  snprintf(messages, 125, "{\"FW\":%.2f,\"DV\":%d,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f, \"EPC\":%d, \"HR\":%.2f, \"TR\":%.2f}", last_version_fw, device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
   client.publish(outTopic, messages);
+
+    if(debug){
+    Serial.println("");
+    Serial.println(messages);
+    Serial.println("");
+  }
+
+  snprintf(messagesSOS, 20, "{\"flag_fire\":%d}", fireDetector);
+  client.publish(outTopicFire, messagesSOS);
     
   if(debug){
     Serial.println("");
-    Serial.println(messages);
+    Serial.println(messagesSOS);
     Serial.println("");
   }
 
@@ -905,18 +956,26 @@ void checkBroker(){
     if (debug == true){
       Serial.println("Broker: CONNECTED!");
       digitalWrite(GPIO_LED_VD, HIGH);
+
+      if(CurrentState != fire_detector){
+        CurrentState = send_data;
+      }
  
-      CurrentState = send_data;
+      
     }
   }
   else {
     digitalWrite(GPIO_LED_VD, HIGH);
     brokerConnect();
     if (!client.state()){
-      CurrentState = send_data;
+      if(CurrentState != fire_detector){
+        CurrentState = send_data;
+      }
     }
     else{
-      CurrentState = save_data;
+      if(CurrentState != fire_detector){
+        CurrentState = save_data;
+      }
     }
   }
 }
@@ -1126,7 +1185,7 @@ void stationControl(){
     Serial.println("--------------------------------------- Station Control");
   }
 
-  if(cont_time_cycle >= TIME_CYCLE && status_platform){
+  if(cont_time_cycle >= TIME_CYCLE && status_platform && !fireDetector){
 
     cont_time_cycle = 0;
     digitalWrite(RELE_1, !digitalRead(RELE_1));
@@ -1263,9 +1322,9 @@ void initIOs(){
 
   Serial.println("--------------------------------------- initIOs");
 
-  if(status_platform){
+  if(status_platform && !fireDetector){ //
     digitalWrite(RELE_1, HIGH);
-    digitalWrite(RELE_2, HIGH);
+    digitalWrite(RELE_2, LOW);
   }
 
   CurrentState = read_eltric_current;
@@ -1445,8 +1504,8 @@ void reconnect() {
     if (client.connect("TestClient","Default","a9232c2f-d3ec-4bfc-a382-82c9c29808ba")) {
       Serial.println("connected");
       // Subscribe
-      client.subscribe(topic_sub,0);
-      client.subscribe(topic_sonoff,0);
+      client.subscribe(outTopicUpOTA,0);
+      client.subscribe(outTopicControl,0);
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -1458,4 +1517,35 @@ void reconnect() {
   }
 }
 
+void check_fire(){
+
+  delay(500);
+  Serial.println("--------------------------------------- FireDetector");
+
+  sendSos();
+
+  if(!digitalRead(DETECTOR_FIRE)){
+    fireDetector = false;
+    restart();
+  }
+}
+
+void sendSos(){
+
+  checkWifi();
+  checkBroker();
+
+  delay(1000);
+  snprintf(messages, 20, "{\"fire\":%d}", fireDetector);
+  client.publish(outTopicFire, messages);
+}
+
+void restart(){
+  timerAlarmDisable(timer0);
+  detachInterrupt(PULSE);
+  count_timerpulse = 0;
+  amostras_index = 0;
+  flag_timer = false;
+  CurrentState = initialization;
+}
 
