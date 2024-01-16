@@ -39,7 +39,7 @@
 #define GPIO_BUTTON 16
 #define GPIO_LED_VM 19 // Led VM =19
 #define GPIO_LED_VD 18 // Led VD =18
-#define DETECTOR_FIRE 39
+#define DETECTOR_FIRE 5
 
  // GPIO 34 = ADC1_CHANNEL_6 (BUFFER_ACS712)
 
@@ -54,12 +54,12 @@
 #define ALARM_TIME_US 1660
 #define BROKER_PORT 1883
 #define OFFSET_AC712 1829
-#define MULTIPLY_FOR_1SEC 602
+#define MULTIPLY_FOR_1SEC 600
 #define TIME_WAIT 10 // 10 segundos
 #define TIME_CHECK_CONTROL 1 // Verificar a cada 1 segundo
 #define MAX_KB_MEMORY 4000 // 180 registros de 28KB (cada linha de registro possui 28KB)
 #define TIMER_INTERVAL_US 1000000
-#define TIME_CYCLE 900 // 900seg = 15 min
+#define TIME_CYCLE 7 // 900seg = 15 min
 #define HOUR_INIT_WORK 8 
 #define HOUR_FINISH_WORK 17
 #define DAY_WEEK_INIT_WORK 1
@@ -140,6 +140,8 @@ char topic_sub [20];
 char topic_sonoff [20];
 
 bool comand_upload = false;
+
+int cont_fire = 0;
 
 String mac = "";
 
@@ -283,8 +285,6 @@ void removeNonPrintableCharacters(String& str);
 void callback(char* topic, byte* message, unsigned int length);
 void reconnect();
 
-void IRAM_ATTR funcao_ISR();
-
 void sendSos();
 
 void restart();
@@ -305,6 +305,7 @@ void IRAM_ATTR Timer0_ISR(){ // Tempo de estouro a cada 1,6ms
   if(CurrentState == read_rpm){ 
     count_timerpulse++;  // para contagem até 1seg para cálculo do rpmCalc
   }
+
 }
 
 void IRAM_ATTR Timer1_ISR() { // Interrupção a cada 1seg para contagem de tempo
@@ -365,8 +366,8 @@ if(strcmp(topic, outTopicControl) == 0){
     if(debug)
     Serial.println("DESLIGA");
     status_platform = false;
-    digitalWrite(RELE_1, LOW);
-    digitalWrite(RELE_2, LOW);
+    digitalWrite(RELE_1, HIGH);
+    digitalWrite(RELE_2, HIGH);
     //digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
   }
 
@@ -374,19 +375,6 @@ if(strcmp(topic, outTopicControl) == 0){
 
 //for(int i=0;i<length;i++)payload[i]='0';
  memset(&payload,0, 1); // "Limpa a sujeira o coteúdo"
-
-}
-
-/* Função ISR (chamada quando há geração da
-interrupção) */
-void IRAM_ATTR funcao_ISR(){
-
-  digitalWrite(RELE_1, LOW);
-  digitalWrite(RELE_2, LOW);
-
-  fireDetector = true;
-
-  CurrentState = fire_detector;
 
 }
 
@@ -399,7 +387,7 @@ void setup() {
   pinMode(RELE_2, OUTPUT);
   pinMode(GPIO_LED_VM, OUTPUT);
   pinMode(GPIO_LED_VD, OUTPUT);
-  pinMode(DETECTOR_FIRE, INPUT);
+  pinMode(DETECTOR_FIRE, INPUT_PULLUP);
 
   digitalWrite(GPIO_LED_VM, LOW);
   digitalWrite(GPIO_LED_VD, LOW);
@@ -460,8 +448,6 @@ void setup() {
   }
 
   checkDayOfWork();
-
-  attachInterrupt(DETECTOR_FIRE, funcao_ISR, RISING);
 
 }
 
@@ -804,7 +790,7 @@ void sendData(){
     TR: Temperatura do ambiente
   */
 
-  snprintf(messages, 125, "{\"FW\":%.2f,\"DV\":%d,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f, \"EPC\":%d, \"HR\":%.2f, \"TR\":%.2f}", last_version_fw, device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
+  snprintf(messages, 125, "{\"FW\":%.2f,\"DV\":%d,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f,\"EPC\":%d,\"HR\":%.2f,\"TR\":%.2f}", last_version_fw, device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
   client.publish(outTopic, messages);
 
     if(debug){
@@ -847,6 +833,7 @@ void currentEletricCalc(){
 
   if (flag_timer){
 
+
     amostras_index++;
 
     amostras[amostras_index] = adc1_get_raw(ADC1_CHANNEL_6) - OFFSET_AC712;
@@ -870,6 +857,10 @@ void currentEletricCalc(){
         rms = sqrt(rms);
 
         current = (0.0127 * rms) - 0.1153;
+
+        if(current <= 0.1){
+          current = 0;
+        }
       }
       else{
         current = 0;
@@ -898,11 +889,11 @@ void rpmCalc(){
 
   if(count_timerpulse == 0){
     timerAlarmEnable(timer0); // Ativa a iterrupção do timer0 para contagem de 1 seg
-    attachInterrupt(PULSE, ExternalInterrupt_ISR, FALLING);
+    attachInterrupt(PULSE, ExternalInterrupt_ISR, RISING); // Ativa a iterrupção externa do timer0 para contagem de 1 seg
   }
 
-  if (count_timerpulse >= MULTIPLY_FOR_1SEC)
-  {
+  if (count_timerpulse >= MULTIPLY_FOR_1SEC){
+
     detachInterrupt(PULSE);
     timerAlarmDisable(timer0);
 
@@ -912,7 +903,7 @@ void rpmCalc(){
     }
 
     count_pulse = (count_pulse / 7); // divide pelo numero de pás
-    rpm = (count_pulse * 60); // multiplica pela quantidade de minutos
+    rpm = (count_pulse * 52); // multiplica pela quantidade de minutos ("52" correção de parâmetro)
 
     if (debug == true){
       Serial.print("RPM: ");
@@ -1250,11 +1241,13 @@ void checkDayOfWork(){
       else{
         work = false;
         Serial.println("work = false 1");
+        checkShutdown();
       }
     }
     else{
       work = false;
       Serial.println("work = false 2");
+      checkShutdown();
     }
 
 
@@ -1287,7 +1280,7 @@ void checkDayOfWork(){
 
           if(cont_time_waiting >= TIME_WAIT){ // Tempo de espera para coleta de dados
             cont_time_waiting = 0;
-            CurrentState = read_eltric_current; 
+            CurrentState = fire_detector; 
           }
           if(device == 0){  
             if(cont_check_station_control >= TIME_CHECK_CONTROL){ // Tempo para verificar o ciclo de 15 min
@@ -1333,10 +1326,12 @@ void initIOs(){
 
 void checkShutdown(){
 
-  if(digitalRead(RELE_1) || digitalRead(RELE_2)){
+    Serial.println("--------------------------------------- initIOs");
 
-    digitalWrite(RELE_1, LOW);
-    digitalWrite(RELE_2, LOW);
+  if(!digitalRead(RELE_1) || !digitalRead(RELE_2)){
+
+    digitalWrite(RELE_1, HIGH);
+    digitalWrite(RELE_2, HIGH);
   }
 }
 
@@ -1520,14 +1515,39 @@ void reconnect() {
 void check_fire(){
 
   delay(500);
-  Serial.println("--------------------------------------- FireDetector");
-
-  sendSos();
+  Serial.println("------------------------------------------------------------------------------------------------------------- CheckFireDetector");
 
   if(!digitalRead(DETECTOR_FIRE)){
-    fireDetector = false;
-    restart();
+    cont_fire++;
+    
+    delay(500);
+      Serial.println("------------------------------------------------------------------------------------------------------------- #01");
   }
+  else {
+    cont_fire = 0;
+    CurrentState = read_eltric_current;
+     Serial.println("------------------------------------------------------------------------------------------------------------- #02");
+  }
+
+
+  if(cont_fire >= 3){
+
+    while (!digitalRead(DETECTOR_FIRE))
+    {
+      CurrentState = fire_detector;
+      fireDetector = true;
+        Serial.println("------------------------------------------------------------------------------------------------------------- Fire");
+      sendSos();
+      delay(500);
+
+    }
+     fireDetector = false;
+     restart();
+      Serial.println("------------------------------------------------------------------------------------------------------------- #03");
+      
+  }
+
+
 }
 
 void sendSos(){
@@ -1536,8 +1556,8 @@ void sendSos(){
   checkBroker();
 
   delay(1000);
-  snprintf(messages, 20, "{\"fire\":%d}", fireDetector);
-  client.publish(outTopicFire, messages);
+  snprintf(messagesSOS, 20, "{\"flag_fire\":%d}", fireDetector);
+  client.publish(outTopicFire, messagesSOS);
 }
 
 void restart(){
