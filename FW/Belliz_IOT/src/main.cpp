@@ -39,7 +39,7 @@
 #define GPIO_BUTTON 16
 #define GPIO_LED_VM 19 // Led VM =19
 #define GPIO_LED_VD 18 // Led VD =18
-#define DETECTOR_FIRE 5
+#define DETECTOR_FIRE 39
 
  // GPIO 34 = ADC1_CHANNEL_6 (BUFFER_ACS712)
 
@@ -53,13 +53,13 @@
 #define PROGRESSIVE_COUNT true
 #define ALARM_TIME_US 1660
 #define BROKER_PORT 1883
-#define OFFSET_AC712 1829
+#define OFFSET_AC712 2016 
 #define MULTIPLY_FOR_1SEC 600
 #define TIME_WAIT 10 // 10 segundos
 #define TIME_CHECK_CONTROL 1 // Verificar a cada 1 segundo
 #define MAX_KB_MEMORY 4000 // 180 registros de 28KB (cada linha de registro possui 28KB)
 #define TIMER_INTERVAL_US 1000000
-#define TIME_CYCLE 7 // 900seg = 15 min
+#define TIME_CYCLE 900 // 900seg = 15 min
 #define HOUR_INIT_WORK 8 
 #define HOUR_FINISH_WORK 17
 #define DAY_WEEK_INIT_WORK 1
@@ -387,7 +387,7 @@ void setup() {
   pinMode(RELE_2, OUTPUT);
   pinMode(GPIO_LED_VM, OUTPUT);
   pinMode(GPIO_LED_VD, OUTPUT);
-  pinMode(DETECTOR_FIRE, INPUT_PULLUP);
+  pinMode(DETECTOR_FIRE, INPUT);
 
   digitalWrite(GPIO_LED_VM, LOW);
   digitalWrite(GPIO_LED_VD, LOW);
@@ -458,6 +458,7 @@ void loop(){
   }
   client.loop();
 
+  
   executeMachineState();
 }
 
@@ -858,7 +859,7 @@ void currentEletricCalc(){
 
         current = (0.0127 * rms) - 0.1153;
 
-        if(current <= 0.1){
+        if(current <= 0.4){ // Caso a corrente seja menor que 0,4A considerar 0A erro de leitura
           current = 0;
         }
       }
@@ -1280,7 +1281,12 @@ void checkDayOfWork(){
 
           if(cont_time_waiting >= TIME_WAIT){ // Tempo de espera para coleta de dados
             cont_time_waiting = 0;
-            CurrentState = fire_detector; 
+            if(device == 0){
+              CurrentState = fire_detector; 
+            }
+            else{
+              CurrentState = read_eltric_current;
+            }
           }
           if(device == 0){  
             if(cont_check_station_control >= TIME_CHECK_CONTROL){ // Tempo para verificar o ciclo de 15 min
@@ -1514,7 +1520,7 @@ void reconnect() {
 
 void check_fire(){
 
-  delay(500);
+  delay(1000);
   Serial.println("------------------------------------------------------------------------------------------------------------- CheckFireDetector");
 
   if(!digitalRead(DETECTOR_FIRE)){
@@ -1530,7 +1536,7 @@ void check_fire(){
   }
 
 
-  if(cont_fire >= 3){
+  if(cont_fire >= 20){
 
     while (!digitalRead(DETECTOR_FIRE))
     {
