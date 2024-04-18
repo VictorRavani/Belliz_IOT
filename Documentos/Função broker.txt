@@ -1,0 +1,9 @@
+  //client.setServer(broker, BROKER_PORT); // Função para definição de Broker mqtt e porta
+  //client.setCallback(callback);
+  //client.subscribe("ravani/button",0);
+
+  //strcpy(topic_sub, mac_not_pointers); // Copia mac_not_pointers para topic_sub
+  //strcat(topic_sub, "/fw"); // Concatena "/fw" a topic_sub
+
+  //client.subscribe(topic_sub,2);
+  //client.subscribe("C8F09E9FB098/fw",2);

@@ -1,6 +1,4 @@
-
 // Implementação OTA 10/01/24
-
 
 ////////////////////////////// BIBLIOTECAS /////////////////////////////////////////////
 
@@ -8,7 +6,7 @@
 #include <max6675.h>
 #include <Wire.h>
 #include <driver/adc.h>
-//#include <esp_adc_cal.h>
+#include <esp_adc_cal.h>
 #include <WiFi.h>
 //#include <freertos/FreeRTOS.h>
 //#include <freertos/task.h>
@@ -18,14 +16,20 @@
 //#include <esp_ipc.h>
 #include "DHT.h"
 #include <Adafruit_Sensor.h>
-
+#include <SPI.h>
 #include "Update.h"
 #include "HTTPClient.h"
 
+#include "ArduinoJson.h"
 
+#include "RTClib.h" //INCLUSÃO DA BIBLIOTECA
 
 //#include "HttpsOTAUpdate.h"
 
+/*Tive um problema com o print e o Tiago add o volatile e voltou a funcionar, dessa forma fica explícito para o compilador. 
+Sem a palavra-chave volatile, o compilador pode otimizar o loop assumindo que o valor da variável não muda dentro do loop, 
+o que poderia levar a um loop infinito se a variável for modificada por uma fonte externa função rpmCalc();
+*/ 
 
 ////////////////////////////// MAPEAMENTO DE HARWARE //////////////////////////////////
 
@@ -46,58 +50,73 @@
 ////////////////////////////// DEFINIÇÕES //////////////////////////////////////////////
 
 #define DHTTYPE DHT22 //define o modelo do sensor (DHT22 / AM2302)
-#define MAX 600
+#define SAMPLES_CURRENTS 600
+#define TIME_SAMPLE_RPM 600  // 600 equivale aproximadamente a 1 segundo.
 #define BAUD_RATE_SERIAL 115200
 #define TIMER_NUM 0
 #define TIMER_PRESCALER 80
 #define PROGRESSIVE_COUNT true
 #define ALARM_TIME_US 1660
 #define BROKER_PORT 1883
-#define OFFSET_AC712 2016 
 #define MULTIPLY_FOR_1SEC 600
-#define TIME_WAIT 10 // 10 segundos
+#define TIME_SEND_JSON 10 // 10 segundos
 #define TIME_CHECK_CONTROL 1 // Verificar a cada 1 segundo
 #define MAX_KB_MEMORY 4000 // 180 registros de 28KB (cada linha de registro possui 28KB)
 #define TIMER_INTERVAL_US 1000000
 #define TIME_CYCLE 900 // 900seg = 15 min
-#define HOUR_INIT_WORK 8 
-#define HOUR_FINISH_WORK 17
-#define DAY_WEEK_INIT_WORK 1
-#define DAY_WEEK_FINISH_WORK 5
-#define ONE_HOUR_IN_SECONDS 8 // 3600 = 1 hora
+#define HOUR_INIT_WORK 8 // 8 horas 
+#define HOUR_FINISH_WORK 17 // 17 horas
+#define DAY_WEEK_INIT_WORK 1 // Segunda 1
+#define DAY_WEEK_FINISH_WORK 5 // sexta 5
+#define ONE_HOUR_IN_SECONDS 3600 // 3600 = 1 hora
+#define MASTER 0
+#define SLAVE 1
+#define NUMBER_ATTEMPTS 1
+#define TIME_ATTEMPTS 10
+#define POWER 1
+#define OFF 0
+#define RTC_UPDATED_ADDRESS 100
 
 /////////////////////////////// DECLARAÇÃO DE VARIÁVEIS /////////////////////////
 
 // NTP SERVER
 const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = (-3 * 3600);
-const int daylightOffset_sec = 3600;
+const int daylightOffset_sec = 0;
+
+RTC_DS3231 rtc; // Cria um objeto RTC_DS3231 para interagir com o módulo RTC
 
 // WIFI
-const char *ssid = "WIFI_MESH_IST"; //WIFI_MESH_IST   ravani
+const char *ssid = "WIFI_MESH_IST"; //WIFI_MESH_IST   ravani1
 const char *password = "ac1ce0ss6_mesh"; //ac1ce0ss6_mesh   senaipos123
 
 // CLIENT MQTT
 const char *brokerUser = "Default";
 const char *brokerPass = "a9232c2f-d3ec-4bfc-a382-82c9c29808ba";
 const char *broker = "mqtt.tago.io";
+const char *brokerId = "TestClient";
 const char *outTopic = "C8F09E9F3688";   // Tópico para envio das infomações padrão ({"FW":1.00,"DV":0,"A":0.00,"RPM":0,"TE":23.50, "EPC":1705337333, "HR":72.20, "TR":22.80}). Será o MAC de cada dispositivo. 
 const char *outTopicFire = "fire";       // Tópico para visualização do sensor de incêndio
 const char *outTopicControl = "control"; // Tópico para controle de liga e desliga da plataforma
 const char *outTopicUpOTA = "UpdateOTA"; // Tópico para verificação de nova versão de firmware
 
-bool flag_timer = false,
+volatile bool flagTimer0 = false; //Tempo de estouro a cada 1,667ms
+
+bool flagTimerRPMCalc = false,
      wifi_flag = false,
      state_relay = false,
      debug = true;
 
-bool status_platform = true; // Flag indicativa de acionamento ou desligamento via protocolo mqtt
+uint16_t volatile cont_cicle = 0;    
+
+bool volatile enabled_station = 0;
+
+bool volatile status_platform = true; // Flag indicativa de acionamento ou desligamento via protocolo mqtt
      
 int count_pulse = 0,
     count_timerpulse = 0, 
-    amostras_index = 0,
     address = 0,
-    address_version_fw = 4001,
+    address_version_fw = 300,
     rpm = 0,
     turn = 0,
     cont_time_cycle = 0,
@@ -106,9 +125,13 @@ int count_pulse = 0,
     sum_sample = 0;
 
 // Master = 0 | Slave = 1
-int device = 0;
+int device = SLAVE;
 
 int year = 0;
+
+uint8_t volatile time_for_send = 0;
+
+float offsetACS712 = 0;
 
 unsigned int cont_hour = 0;
 
@@ -118,18 +141,16 @@ bool last_work = false;
 bool work = false;
 
 float temperature = 0,
-      amostras[MAX + 1],
-      rms = 0,
-      current = 0,
+      electricCurrent = 0,
       temperature_room = 0,
       humidity_room = 0;
 
 unsigned long epochTime = 0,
               last_millis_cycle = 0;     
 
-bool fireDetector = false;
+bool volatile fireDetector = false;
 
-char messages[125];
+char messages[140];
 char messagesSOS[20];
 
 char mac_address [13];
@@ -139,9 +160,19 @@ char mac_not_pointers [13];
 char topic_sub [20]; 
 char topic_sonoff [20];
 
+const char *sufixo = "/pub";
+
+const char *sufixo2 = "/control";
+
+const char *sufixo3 = "/update";
+
+char resultado[100];  // Ajuste o tamanho conforme necessário
+char resultado1[100];  // Ajuste o tamanho conforme necessário
+char resultado2[100];  // Ajuste o tamanho conforme necessário
+
 bool comand_upload = false;
 
-int cont_fire = 0;
+
 
 String mac = "";
 
@@ -162,27 +193,23 @@ DHT dht(DHTPIN, DHTTYPE);
 
 enum MachineStates{
 
-  initialization =  0,
-  read_eltric_current,
-  read_rpm,
-  read_temperature,
-  read_temp_humidity_romm,
-  read_epoch,
+  initialization_output =  0,
+  read_sensors,  
   check_connections,
   send_data,
   save_data,
-  waiting_for_time,
+  stations_control,
   fire_detector
 };
 
 MachineStates CurrentState;
 
 // URL do arquivo .txt a ser baixado
-String url_txt = "http://192.168.86.202:5000/firmware/txt.txt";
-String url_firmware = "http://192.168.86.202:5000/firmware/firmware.bin";
+String url_txt = "https://api.tago.io/file/637f7c0613e3120011a2a95e/Firmware_Belliz_IOT/txt.txt";
+String url_firmware = "https://api.tago.io/file/637f7c0613e3120011a2a95e/Firmware_Belliz_IOT/firmware.bin";
 
-String version_fw = "1.0";
-float last_version_fw = 1.0;
+String version_fw = "1.1";
+float last_version_fw = 1.1;
   
 HTTPClient http;
 
@@ -190,7 +217,9 @@ const int MAX_LINES = 5; // Número máximo de linhas que você espera no arquiv
 
 String linhas[MAX_LINES]; // Array para armazenar as linhas do arquivo
 
-RTC_DATA_ATTR int bootCount = 0;
+uint8_t rtcUpdated = 0XFF;
+
+uint8_t volatile contagem_do_interrupt = 0;
 
 /////////////////////////////// PROTÓTIPOS DE FUNÇÕES /////////////////////////////////////
 
@@ -198,10 +227,10 @@ RTC_DATA_ATTR int bootCount = 0;
 void executeMachineState();
 
 // Função para conexão do Broker MQTT
-void brokerConnect();
+bool brokerConnect();
 
-// Função para conexão da rede wi-fi
-void wifiConnect();
+// Função para conexão da rede wi-fi. TRUE = CONNECTED; FALSE = DISCONNECTED
+bool wifiConnect();
 
 // Função para configuração do ADC1
 void adc1Config();
@@ -225,10 +254,7 @@ void timer0Config();
 void timer1Config();
 
 // Função para calcular a corrente elétrica
-void currentEletricCalc();
-
-// Função para cálculo da temperatura
-void temperatureCalc();
+float electricCurrentCalc();
 
 // Função para realizar a leitura do sensor DHT22
 void ambientTempHumidity();
@@ -237,13 +263,7 @@ void ambientTempHumidity();
 void sendData();
 
 // Função para calcular o RPM
-void rpmCalc();
-
-// Função para verificar a conexão wi-fi
-void checkWifi();
-
-// Função para verificar a conexão com o Broker
-void checkBroker();
+int rpmCalc();
 
 // Função para gravar as informações na memória EEPROM 
 void eepromWrite();
@@ -252,14 +272,14 @@ void eepromWrite();
 void eepromRead();
 
 // Função para registro do tempo
-void readEpoch();
+unsigned long readEpoch();
 
 // Função para controle dos ciclos de 15min das estações
 void stationControl();
 
 // Função para controlar o dia de trabalho da estação
 // 1 = Dia de trabalho | 0 = Folga 
-void checkDayOfWork();
+bool checkDayOfWork();
 
 // Função para definir o estado atual dos periféricos
 void initIOs();
@@ -274,7 +294,7 @@ void getTxt();
 void updateFirmware();
 
 //Função para verifiar o sensor de fumaça
-void check_fire();
+int check_fire();
 
 // Função para verificação de caracteres não impressos
 bool hasNonPrintableCharacters(const String& str);
@@ -283,44 +303,48 @@ bool hasNonPrintableCharacters(const String& str);
 void removeNonPrintableCharacters(String& str);
 
 void callback(char* topic, byte* message, unsigned int length);
+
 void reconnect();
 
-void sendSos();
+// Função para calibrar o valor de offset do módulo ACS712
+float calibration_ACS712();
 
-void restart();
+void readSensors();
+
+void printDate(DateTime dt);
+
+void updateRTC();
+
+void main_control();
+
+void cyles_control();
 
 /////////////////////////////// FUNÇÕES DE CALLBACK ///////////////////////////////////
+
+void IRAM_ATTR buttonInterrupt() {
+  
+
+}
 
 void IRAM_ATTR ExternalInterrupt_ISR(){ // Interrupção externa para contagem de pulsos do cooler
   
   count_pulse++;
 }
 
-void IRAM_ATTR Timer0_ISR(){ // Tempo de estouro a cada 1,6ms
+void IRAM_ATTR Timer0_ISR(){ // Tempo de estouro a cada 1,667ms
 
-  if(CurrentState == read_eltric_current){ 
-    flag_timer = true;   // Coleta a cada 1,6ms (10 amostras por ciclo 16,6ms)
-  }
-
-  if(CurrentState == read_rpm){ 
-    count_timerpulse++;  // para contagem até 1seg para cálculo do rpmCalc
-  }
-
+  flagTimer0 = true; 
 }
 
 void IRAM_ATTR Timer1_ISR() { // Interrupção a cada 1seg para contagem de tempo
 
  invert_1s ++;
  cont_hour ++;
+ time_for_send++;
 
-  if(work && !fireDetector){
-    cont_time_cycle ++; 
-    cont_time_waiting ++;
-
-    if((device == 0) && !fireDetector){  
-      cont_check_station_control ++;
-    }
-  }
+ if(enabled_station){
+    cont_cicle++;
+ }
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -341,14 +365,14 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if(strcmp(topic, outTopicUpOTA) == 0){
   if ((char)payload[0] == '1') {
     if(debug)
-    Serial.println("ON");
+    Serial.println("ATUALIZACAO OTA");
     comand_upload = true;
     //digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
     // but actually the LED is on; this is because
     // it is active low on the ESP-01)
   } else if ((char)payload[0] == '0'){
     if(debug)
-    Serial.println("OFF");
+    Serial.println("OFF OTA");
     comand_upload = false;
     //digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
   }
@@ -358,7 +382,6 @@ if(strcmp(topic, outTopicControl) == 0){
     if(debug)
     Serial.println("LIGA");
     status_platform = true;
-    restart();
     //digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
     // but actually the LED is on; this is because
     // it is active low on the ESP-01)
@@ -366,8 +389,8 @@ if(strcmp(topic, outTopicControl) == 0){
     if(debug)
     Serial.println("DESLIGA");
     status_platform = false;
-    digitalWrite(RELE_1, HIGH);
-    digitalWrite(RELE_2, HIGH);
+    digitalWrite(RELE_1, LOW);
+    digitalWrite(RELE_2, LOW);
     //digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
   }
 
@@ -378,23 +401,22 @@ if(strcmp(topic, outTopicControl) == 0){
 
 }
 
-
 ////////////////// FUNÇÕES PRINCIPAIS DO FRAMEWORK DO ARDUINO /////////////////////////
 
 void setup() {
 
-  pinMode(RELE_1, OUTPUT);
-  pinMode(RELE_2, OUTPUT);
-  pinMode(GPIO_LED_VM, OUTPUT);
-  pinMode(GPIO_LED_VD, OUTPUT);
-  pinMode(DETECTOR_FIRE, INPUT);
-
-  digitalWrite(GPIO_LED_VM, LOW);
-  digitalWrite(GPIO_LED_VD, LOW);
-
   Serial.begin(BAUD_RATE_SERIAL);
 
-  EEPROM.begin(4096);
+  pinMode(GPIO_LED_VM, OUTPUT);
+  pinMode(GPIO_LED_VD, OUTPUT);
+
+  digitalWrite(GPIO_LED_VM, LOW);  // Iniíco Desligado
+  digitalWrite(GPIO_LED_VD, LOW);  // Iniíco Desligado
+
+  pinMode(RELE_1, OUTPUT);
+  pinMode(RELE_2, OUTPUT);
+
+  EEPROM.begin(512);
 
   esp_reset_reason_t reason = esp_reset_reason();
   
@@ -402,8 +424,8 @@ void setup() {
     case ESP_RST_POWERON:
       if(debug)
         Serial.println("Reinício após falha de energia (PWRON)");
-        EEPROM.writeFloat(address_version_fw, 1.0);
-        EEPROM.commit();
+        //EEPROM.writeFloat(address_version_fw, 1.0);
+        //EEPROM.commit();
         break;
     case ESP_RST_EXT:
       if(debug)
@@ -436,19 +458,44 @@ void setup() {
 
   updateEpoch();
 
-  dht.begin();
-
-  device = selectModeDevice();
-
-  EEPROM.get(address_version_fw, last_version_fw);
+  //EEPROM.get(address_version_fw, last_version_fw);
 
   if(debug){
   Serial.print("last_version_fw");
   Serial.println(last_version_fw);
   }
 
-  checkDayOfWork();
+  //device = selectModeDevice();
 
+  offsetACS712 = calibration_ACS712();
+
+  if(device == MASTER){
+
+    pinMode(RELE_1, OUTPUT);
+    pinMode(RELE_2, OUTPUT);
+    pinMode(DETECTOR_FIRE, INPUT);
+    //attachInterrupt(digitalPinToInterrupt(DETECTOR_FIRE), buttonInterrupt, FALLING); // Configura a interrupção no pino do botão
+
+    dht.begin();
+    rtc.begin(); // Inicializa o módulo RTC
+
+    Serial.print("rtcUpdated: ");
+    Serial.println(rtcUpdated);
+
+    EEPROM.get(RTC_UPDATED_ADDRESS, rtcUpdated);
+
+    Serial.print("rtcUpdated: ");
+    Serial.println(rtcUpdated);
+
+    if (rtcUpdated == 0XFF) { // Se a memória Flash estiver apagada
+      Serial.println("------------- UPDATE RTC ----------- UPDATE RTC -----------");
+      updateRTC();
+    }
+    CurrentState = stations_control;
+  }else{
+
+    CurrentState = read_sensors;
+  }
 }
 
 void loop(){
@@ -468,33 +515,17 @@ void executeMachineState(){
 
   switch (CurrentState){
 
-  case initialization:
+  case initialization_output:
     initIOs();
     break;
 
-  case read_eltric_current:
-    currentEletricCalc();
-    break;
-
-  case read_rpm:
-    rpmCalc();
-    break;         
-
-  case read_temperature:
-    temperatureCalc();
-    break;
-
-  case read_temp_humidity_romm:
-    ambientTempHumidity();
-    break;
-
-  case read_epoch:
-    readEpoch();
+  case read_sensors:
+    readSensors();
     break;  
 
   case check_connections:
-    checkWifi();
-    checkBroker();
+    wifiConnect();
+    brokerConnect();
     break;
 
   case send_data:
@@ -505,13 +536,14 @@ void executeMachineState(){
     eepromWrite();
     break;
   
-  case waiting_for_time:
-    checkDayOfWork();
+  case stations_control:
+    main_control();
     break;
 
   case fire_detector:
     check_fire();
-    break;  
+    break; 
+
   }
 }
 
@@ -552,10 +584,16 @@ void adc1Config(){
 
   adc1_config_width(ADC_WIDTH_BIT_12); // CONFIGURA RESOLUÇÃO DE 12 BITS NO ADC1
   adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11); // CONFIGURA RESOLUÇÃO DE 11 dB NO ADC1 (GPIO 34)
-
+  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11); // CONFIGURA RESOLUÇÃO DE 11 dB NO ADC1 (GPIO 36)
+  
 }
 
 int getMAC(){
+
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Function GET MAC");
+  }
 
   int macWithoutDots;
   int a = 0; 
@@ -581,10 +619,46 @@ int getMAC(){
 
   outTopic = mac_not_pointers;
 
-  if(debug){
-    Serial.print("ESP Board MAC Address:  ");
+  const char *sufixo2 = "/sub/control";
+
+  const char *sufixo3 = "/sub/update";
+
+    // Tamanho máximo possível do buffer de resultado
+    // (considerando o comprimento máximo de prefixo e nomeTopico)
+
+    // Copie o primeiro string para o buffer de resultado
+    strcpy(resultado, outTopic);
+
+    // Concatene o segundo string no buffer de resultado
+    strcat(resultado, sufixo);
+
+    outTopic = resultado;
+
+    // Copie o primeiro string para o buffer de resultado
+    strcpy(resultado1, mac_not_pointers);
+
+    // Concatene o segundo string no buffer de resultado
+    strcat(resultado1, sufixo2);
+
+    outTopicControl = resultado1;
+
+    // Copie o primeiro string para o buffer de resultado
+    strcpy(resultado2, mac_not_pointers);
+
+    // Concatene o segundo string no buffer de resultado
+    strcat(resultado2, sufixo3);
+
+    outTopicUpOTA = resultado2;
+
+    Serial.print("outTopic: ");
     Serial.println(outTopic);
-  }
+
+    Serial.print("outTopicUpOTA: ");
+    Serial.println(outTopicUpOTA);
+
+    Serial.print("outTopicControl: ");
+    Serial.println(outTopicControl);  
+
   return macWithoutDots;
 }
 
@@ -620,58 +694,110 @@ void updateEpoch(){
 
 }
 
-void brokerConnect(){
+bool brokerConnect(){
 
-  if (debug == true){
+/* Possible values for client.state()
+    #define MQTT_CONNECTION_TIMEOUT     -4
+    #define MQTT_CONNECTION_LOST        -3
+    #define MQTT_CONNECT_FAILED         -2
+    #define MQTT_DISCONNECTED           -1
+    #define MQTT_CONNECTED               0
+    #define MQTT_CONNECT_BAD_PROTOCOL    1
+    #define MQTT_CONNECT_BAD_CLIENT_ID   2
+    #define MQTT_CONNECT_UNAVAILABLE     3
+    #define MQTT_CONNECT_BAD_CREDENTIALS 4
+    #define MQTT_CONNECT_UNAUTHORIZED    5  */
+
+  bool    brokerConnect = false;
+  uint8_t tryAgain      = 0;
+
+  if (debug){
     Serial.println("");
     Serial.println("--------------------------------------- Function BROKER Connect");
-    Serial.print("Conecting to: ");
-    Serial.println(broker);
   }
 
-  client.setServer(broker, BROKER_PORT); // Função para definição de Broker mqtt e porta
-  client.setCallback(callback);
-  //client.subscribe("ravani/button",0);
+  if (client.state() == MQTT_CONNECTED){  // Verifica o status da conexão no Broker
 
-  //strcpy(topic_sub, mac_not_pointers); // Copia mac_not_pointers para topic_sub
-  //strcat(topic_sub, "/fw"); // Concatena "/fw" a topic_sub
+    brokerConnect = true;
+    digitalWrite(GPIO_LED_VD, HIGH);
+    digitalWrite(GPIO_LED_VM, LOW);  
 
-  //client.subscribe(topic_sub,2);
-  //client.subscribe("C8F09E9FB098/fw",2);
-
-  Serial.print("Topic Subscribe: ");
-  Serial.println(outTopicUpOTA);
-  Serial.print("Topic Subscribe: ");
-  Serial.println(outTopicControl);
-
-      if (client.connect("TestClient","Default","a9232c2f-d3ec-4bfc-a382-82c9c29808ba")) {
-      Serial.println("connected");
-      // Subscribe
-      client.subscribe(outTopicUpOTA,0);
-      client.subscribe(outTopicControl,0);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
-
-  if (!client.state()){ 
-  
-    if (debug == true){
+    if(debug){
+      Serial.println("");
       Serial.println("Broker: CONNECTED!");
-    }
+      Serial.println("");
+    } 
   }
-  else {
-    if (debug == true){
-      Serial.println("Broker: Fail in conection! ");
-      digitalWrite(GPIO_LED_VD, LOW);
-      Serial.print("Broker state: ");
-      Serial.println(client.state());
-      
+  else if(wifiConnect()){
+    while(!brokerConnect && tryAgain <= NUMBER_ATTEMPTS){
+        
+      if (debug == true){
+        Serial.println("");
+        Serial.print("Conecting to: ");
+        Serial.println(broker);
+      }
+
+      client.setServer(broker, BROKER_PORT); // Função para definição de Broker mqtt e porta
+      client.setCallback(callback);
+      client.connect(brokerId,brokerUser,brokerPass);
+
+      uint8_t i = 0;
+      while (!brokerConnect && i <=TIME_ATTEMPTS){
+  
+        Serial.print(".");
+        delay(1000);
+        i++;
+
+        if (client.state() == MQTT_CONNECTED){
+
+          client.subscribe(outTopicUpOTA,0);
+          client.subscribe(outTopicControl,0);
+
+          if(debug){
+            Serial.println("");
+            Serial.println("Broker: CONNECTED!");
+            Serial.print("Broker: ");
+            Serial.println(broker);
+            Serial.print("Topic Subscribe: ");
+            Serial.println(outTopicUpOTA);
+            Serial.print("Topic Subscribe: ");
+            Serial.println(outTopicControl);
+            Serial.println("");
+          } 
+
+          brokerConnect = true;
+          digitalWrite(GPIO_LED_VD, HIGH);
+          digitalWrite(GPIO_LED_VM, LOW);  
+        }
+        else{
+          digitalWrite(GPIO_LED_VD, LOW); 
+          digitalWrite(GPIO_LED_VM, HIGH);  
+        }
+      }
+
+      if(!brokerConnect){
+        Serial.println("");
+        Serial.println("Broker Fail in conection! ");
+        Serial.print("Broker state: ");
+        Serial.println(client.state());
+        Serial.println("");
+
+        tryAgain++;
+      }
     }
+  }else{
+    digitalWrite(GPIO_LED_VD, LOW);  // Iniíco Desligado
+    digitalWrite(GPIO_LED_VM, HIGH);  // Iniíco Desligado
+    
+    if(debug){
+      Serial.println("");
+      Serial.println("Wi-Fi: CONNECTION FAIL!");
+      Serial.println("");
+      Serial.println("Broker: CONNECTION FAIL");
+      Serial.println("");
+    } 
   }
+  return brokerConnect;
 }
 
 unsigned long getTime(){
@@ -685,68 +811,75 @@ unsigned long getTime(){
   return now;
 }
 
-void wifiConnect(){
+bool wifiConnect(){
 
-  int i = 0;
-  
+  bool     wifiConnected  = false;
+  uint8_t  tryAgain       = 0;
+
   if (debug == true){
     Serial.println("");
     Serial.println("--------------------------------------- Function WIFI Connect");
-    Serial.print("Conecting to: ");
-    Serial.println(ssid);
   }
 
-  WiFi.begin(ssid, password);
+  if (WiFi.status() == WL_CONNECTED){
 
-  while((i <= 30) && (WiFi.status() != WL_CONNECTED)){
+    wifiConnected = true;
 
-    if (debug == true){
-      Serial.print(".");
-    }
-    i++;
-    delay(1000);
-  }
-
-  if (WiFi.status() != WL_CONNECTED){
-    if (debug == true){
-      Serial.println("");
-      Serial.println("W-Fi: Fail in conection! ");
-      Serial.print("Wi-FI state: ");
-      Serial.println(WiFi.status());
-      Serial.print("IP obtido: ");
-      Serial.println(WiFi.localIP());
-    }
-  }
-  else{
     if(debug){
       Serial.println("");
       Serial.println("Wi-FI: CONNECTED!");
+      Serial.println("");
+    } 
+  }
+  else{
+    digitalWrite(GPIO_LED_VD, LOW); 
+    digitalWrite(GPIO_LED_VM, HIGH);  
+
+    while (!wifiConnected && tryAgain <= NUMBER_ATTEMPTS ){
+
+      if (debug == true){
+        Serial.print("Conecting to: ");
+        Serial.println(ssid);
+      }
+
+      WiFi.begin(ssid, password);
+
+      uint8_t i = 0;
+      while (!wifiConnected && i <=TIME_ATTEMPTS){
+    
+        Serial.print(".");
+        delay(1000);
+        i++;
+
+        if (WiFi.status() == WL_CONNECTED){
+
+          wifiConnected = true;
+
+          if(debug){
+            Serial.println("");
+            Serial.println("Wi-FI: CONNECTED!");
+            Serial.print("IP obtido: ");
+            Serial.println(WiFi.localIP());
+          }  
+        }
+      }
+
+      if(!wifiConnected){
+
+        Serial.println("");
+        Serial.println("W-Fi: Fail in conection! ");
+        Serial.print("Wi-FI state: ");
+        Serial.println(WiFi.status());
+        Serial.println("");
+
+        tryAgain++;
+      }
     }
   }
-
-}
-
-void temperatureCalc(){
-
-  if(debug){
-    Serial.println("");
-    Serial.println("--------------------------------------- Calculate Temperature");
-  }
-
-  temperature = temp.readCelsius();
-
-  if(debug){
-    Serial.print("Temperature: ");
-    Serial.println(temperature);
-  }
-
-  CurrentState = read_temp_humidity_romm;
-
+  return wifiConnected;
 }
 
 void ambientTempHumidity(){
-
-  if(device == 0){
 
     if(debug){
       Serial.println("");
@@ -763,21 +896,40 @@ void ambientTempHumidity(){
       Serial.print("Temperature in room: "); 
       Serial.print(dht.readTemperature(), 0); 
       Serial.println("*C"); 
-    }
-  }
-  CurrentState = read_epoch;
+    } 
 }
 
 void sendData(){
 
+  uint8_t cont_fire = 0;
+
   if (debug){
     Serial.println("");
     Serial.println("--------------------------------------- Send Data");
-    Serial.println("");
-    Serial.print("Topic: ");
-    Serial.println(outTopic);
-    Serial.println("");
   }
+
+  while (time_for_send <= TIME_SEND_JSON) // Aguardando o tempo para envio.
+  {
+    if(!check_fire()){
+      cont_fire++;
+    }else {
+      cont_fire = 0;
+      fireDetector = false;
+    }
+
+    delay(500);
+
+    if(cont_fire >= 4){
+      fireDetector = true;
+    }
+  }
+  
+  if(brokerConnect()){
+
+    if (debug){
+      Serial.print("Topic: ");
+      Serial.println(outTopic);
+    }
 
   /* descrição dos parâmetros:
 
@@ -791,185 +943,145 @@ void sendData(){
     TR: Temperatura do ambiente
   */
 
-  snprintf(messages, 125, "{\"FW\":%.2f,\"DV\":%d,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f,\"EPC\":%d,\"HR\":%.2f,\"TR\":%.2f}", last_version_fw, device, current, rpm, temperature, epochTime, humidity_room, temperature_room);
-  client.publish(outTopic, messages);
+    if(device == MASTER){
+
+      snprintf(messages, 140, "{\"FW\":%.1f,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f,\"EPC\":%d,\"HR\":%.2f,\"TR\":%.2f,\"FIRE\":%d}", last_version_fw, electricCurrent, rpm, temperature, epochTime, humidity_room, temperature_room, fireDetector);
+      client.publish(outTopic, messages);
+    }
+
+
+    if(device == SLAVE){
+
+    snprintf(messages, 125, "{\"FW\":%.1f,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f,\"EPC\":%d}", last_version_fw, electricCurrent, rpm, temperature, epochTime);
+    client.publish(outTopic, messages);
+    }
 
     if(debug){
-    Serial.println("");
-    Serial.println(messages);
-    Serial.println("");
+      Serial.println("");
+      Serial.println(messages);
+      Serial.println("");
+    }
+  time_for_send = 0;
   }
 
-  snprintf(messagesSOS, 20, "{\"flag_fire\":%d}", fireDetector);
-  client.publish(outTopicFire, messagesSOS);
-    
+  if(device == MASTER){
+
+    CurrentState = stations_control;
+
+  }else{
+    CurrentState = read_sensors;
+  }
+
+}
+
+float electricCurrentCalc(){
+
+  bool  finisherCalculate = false;
+  float currentCalculate = 0;
+  float amostras[SAMPLES_CURRENTS];
+  volatile int   amostras_index = 0;
+  float rms = 0;
+
+  flagTimer0 = false;
+
   if(debug){
     Serial.println("");
-    Serial.println(messagesSOS);
-    Serial.println("");
-  }
-
-  if (address > 0){
-    eepromRead();
-  }
-
-  if (address == 0){
-
-    CurrentState = waiting_for_time;
-  }
-  
-}
-
-void currentEletricCalc(){
-
-  if(debug && turn !=  1){
-    Serial.println("");
     Serial.println("--------------------------------------- Calculate Eletric Current");
-    turn = 1;
   }
 
-  if (amostras_index == 0){
-    timerAlarmEnable(timer0); // Ativa a iterrupção do timer0
-  }  
+  timerAlarmEnable(timer0); // Ativa a iterrupção do timer0
+ 
+  while (!finisherCalculate){
 
-  if (flag_timer){
+    if (flagTimer0){
 
+      amostras[amostras_index] = adc1_get_raw(ADC1_CHANNEL_6) - offsetACS712;
 
-    amostras_index++;
+      amostras_index++;
+      
+      flagTimer0 = false;
+    }
 
-    amostras[amostras_index] = adc1_get_raw(ADC1_CHANNEL_6) - OFFSET_AC712;
-    
-    flag_timer = false;
+    if (amostras_index >= SAMPLES_CURRENTS){
 
-    sum_sample += adc1_get_raw(ADC1_CHANNEL_6);
-
-    if (amostras_index == MAX){
       timerAlarmDisable(timer0);
 
-      if(sum_sample > 0){
+       amostras_index = 0;
 
-        for (int i = 0; i <= MAX; i++){
-
-          rms += amostras[i] * amostras[i];
-        }
+      for (int i = 0; i <= (SAMPLES_CURRENTS - 1); i++){  // Cada valor elevado ao quadrado (leitura de 600 valores de 0 até 599) 
+        rms += amostras[i] * amostras[i];
+      }
         
-        rms /= (double)MAX;
+      rms /= (double)(SAMPLES_CURRENTS - 1);  // Média da somatória ao quadrado
 
-        rms = sqrt(rms);
+      rms = sqrt(rms); // Raiz quadradado do total
 
-        current = (0.0127 * rms) - 0.1153;
+      currentCalculate = (0.0122 * rms) - 0.0035;  // Equação da reta para determinar o valor da corrente. 
 
-        if(current <= 0.4){ // Caso a corrente seja menor que 0,4A considerar 0A erro de leitura
-          current = 0;
-        }
-      }
-      else{
-        current = 0;
+      if (currentCalculate <= 0.3){
+
+        currentCalculate = 0.0;
       }
 
-      amostras_index = 0;
-
-      if(debug){
-        Serial.print("current: ");
-        Serial.println(current);
+      for (int i = 0; i <= (SAMPLES_CURRENTS - 1); i++){  // Zerando o Array
+        amostras[i] = 0;
       }
 
-        CurrentState = read_rpm;
-        turn = 0;
+      finisherCalculate = true;
     }
   }
+
+  if(debug){
+    Serial.print("Current: ");
+    Serial.print(currentCalculate);
+    Serial.println("A");
+  }
+
+  return currentCalculate;
 }
 
-void rpmCalc(){
+int rpmCalc(){
 
-  if(debug && turn !=  1){
+  bool finisherCalculateRPM = false;
+  volatile int  cont = 0; // 
+  int  rpmCalc = 0;
+
+  flagTimer0 = false;
+
+  if(debug){
     Serial.println("");
     Serial.println("--------------------------------------- Calculate RPM");
-    turn = 1;
   }
 
-  if(count_timerpulse == 0){
-    timerAlarmEnable(timer0); // Ativa a iterrupção do timer0 para contagem de 1 seg
-    attachInterrupt(PULSE, ExternalInterrupt_ISR, RISING); // Ativa a iterrupção externa do timer0 para contagem de 1 seg
-  }
+  timerAlarmEnable(timer0); // Ativa a iterrupção do timer0
+  attachInterrupt(PULSE, ExternalInterrupt_ISR, RISING); // Ativa a iterrupção externa (contagem dos pulsos).
 
-  if (count_timerpulse >= MULTIPLY_FOR_1SEC){
+  while (!finisherCalculateRPM){
 
-    detachInterrupt(PULSE);
-    timerAlarmDisable(timer0);
-
-    if (debug == true){
-      Serial.print("Pulse per seconds: ");
-      Serial.println(count_pulse);
+    if (flagTimer0){ // Contador para 1 segundo (Delay)
+      cont++;
+      flagTimer0 = false;
+     // Serial.println(cont);
     }
 
-    count_pulse = (count_pulse / 7); // divide pelo numero de pás
-    rpm = (count_pulse * 52); // multiplica pela quantidade de minutos ("52" correção de parâmetro)
+    if(cont >= TIME_SAMPLE_RPM){ // contador para determinar o tempo de amostragem
+      detachInterrupt(PULSE);  // Desliga a iterrupção externa (contagem dos pulsos).
+      timerAlarmDisable(timer0);  // Desliga Timer 0
 
-    if (debug == true){
-      Serial.print("RPM: ");
-      Serial.println(rpm);
-    }
-
-    count_timerpulse = 0;
-    turn = 0;
-    CurrentState = read_temperature;
-  }
-
-}
-
-void checkWifi(){
-
-  if (debug == true){
-    Serial.println("");
-    Serial.println("--------------------------------------- Check WIFI");
-  }
-
-  if (WiFi.status() != WL_CONNECTED){
-    wifiConnect();
-  }
-  else{
-    if(debug){
-      Serial.println("Wi-FI: CONNECTED!");
-    }
-  }
-}
-
-void checkBroker(){
-
-  if (debug == true){
-    Serial.println("");
-    Serial.println("--------------------------------------- Check BROKER");
-  }
-
-
-  if (!client.state()){ 
-
-    if (debug == true){
-      Serial.println("Broker: CONNECTED!");
-      digitalWrite(GPIO_LED_VD, HIGH);
-
-      if(CurrentState != fire_detector){
-        CurrentState = send_data;
-      }
- 
+      count_pulse = (count_pulse / 7); // divide pelo numero de pás
+      rpmCalc = (count_pulse * 60); // multiplica pela quantidade de minutos ("52" correção de parâmetro)
       
+      count_pulse = 0; // Zera contagem de pulsos anterior (variável global)
+      finisherCalculateRPM = true;
     }
   }
-  else {
-    digitalWrite(GPIO_LED_VD, HIGH);
-    brokerConnect();
-    if (!client.state()){
-      if(CurrentState != fire_detector){
-        CurrentState = send_data;
-      }
-    }
-    else{
-      if(CurrentState != fire_detector){
-        CurrentState = save_data;
-      }
-    }
+
+  if (debug){
+    Serial.print("RPM: ");
+    Serial.println(rpmCalc);
   }
+
+  return rpmCalc;
 }
 
 void eepromWrite(){
@@ -982,7 +1094,7 @@ void eepromWrite(){
   }
 
   if(address >= MAX_KB_MEMORY){
-    CurrentState = waiting_for_time;
+    CurrentState = stations_control;
   }
   else{
 
@@ -997,12 +1109,12 @@ void eepromWrite(){
     Serial.println(address);
   }
 
-  EEPROM.writeFloat(address, current);
-  address += sizeof(current);
+  EEPROM.writeFloat(address, electricCurrent);
+  address += sizeof(electricCurrent);
 
   if(debug){
-    Serial.print("current: ");
-    Serial.println(current);
+    Serial.print("electricCurrent: ");
+    Serial.println(electricCurrent);
     Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
@@ -1064,23 +1176,25 @@ void eepromWrite(){
 
   EEPROM.commit();
 
-  CurrentState = waiting_for_time;
+  CurrentState = stations_control;
 
   }
 }
 
-void readEpoch(){
+unsigned long readEpoch(){
 
-  epochTime = getTime();
+  unsigned long epoch = 0;
+
+  epoch = getTime();
 
   if(debug){
     Serial.println("");
     Serial.println("--------------------------------------- ReadEpoch");
     Serial.print("readEpoch: ");
-    Serial.print(epochTime);
+    Serial.println(epoch);
   }
 
-  CurrentState = check_connections;
+  return epoch;
 }
 
 void eepromRead(){
@@ -1148,17 +1262,17 @@ void eepromRead(){
   }   
 
   address -= sizeof(rpm); 
-  EEPROM.get(address, current);
+  EEPROM.get(address, electricCurrent);
 
   if(debug){
-    Serial.print("current: ");
-    Serial.println(current);
+    Serial.print("electricCurrent: ");
+    Serial.println(electricCurrent);
     Serial.println("");
     Serial.print("address: ");
     Serial.println(address);
   }  
 
-  address -= sizeof(current); 
+  address -= sizeof(electricCurrent); 
   EEPROM.get(address, device);
 
   if(debug){
@@ -1177,7 +1291,7 @@ void stationControl(){
     Serial.println("--------------------------------------- Station Control");
   }
 
-  if(cont_time_cycle >= TIME_CYCLE && status_platform && !fireDetector){
+  if(cont_time_cycle >= TIME_CYCLE && status_platform){
 
     cont_time_cycle = 0;
     digitalWrite(RELE_1, !digitalRead(RELE_1));
@@ -1196,145 +1310,62 @@ void stationControl(){
   }
 }
 
-void checkDayOfWork(){
+bool checkDayOfWork(){
 
-  if(invert_1s >= 1){
+  bool work_day = false;
 
-    invert_1s = 0;
+  DateTime now = rtc.now(); // Obtém a data e hora atual do RTC
 
-    getTime();
+  uint8_t dayOfWeek = now.dayOfTheWeek(); // Obtém o dia da semana
 
-    if(debug){
+  uint8_t  hour_RTC = now.hour(); // hora  
 
-      Serial.println("");
-      Serial.println("--------------------------------------- Check Day Of Work");
-    
-      Serial.print("Hour: ");
-      Serial.print(timeinfo.tm_hour);
-      Serial.print(":");  
-      Serial.print(timeinfo.tm_min);
-      Serial.print(":"); 
-      Serial.println(timeinfo.tm_sec);
+  if(debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Function CheckDayOfWork");
+    Serial.println("dayOfWeek");
+    Serial.println(dayOfWeek);
+    Serial.println("hour_RTC");
+    Serial.println(hour_RTC);
+  }
 
-      Serial.print("");  
-      Serial.print("day week: ");
-      Serial.println(timeinfo.tm_wday); 
+  printDate(now); // Chama a função para imprimir a data completa
+ 
+      if((dayOfWeek >= DAY_WEEK_INIT_WORK) && (dayOfWeek <= DAY_WEEK_FINISH_WORK)){ // É um dia útil?
 
-      Serial.print("");  
-      Serial.print("Date: ");
-      Serial.print(timeinfo.tm_mday);  
-      Serial.print("/"); 
-      Serial.print(timeinfo.tm_mon); 
-      Serial.print("/"); 
-      year = timeinfo.tm_year + 1900;
-      Serial.println(year);  
-    }
-
-    if((timeinfo.tm_wday >= DAY_WEEK_INIT_WORK) && (timeinfo.tm_wday <= DAY_WEEK_FINISH_WORK)){
-
-      if((timeinfo.tm_hour >= HOUR_INIT_WORK) && (timeinfo.tm_hour < HOUR_FINISH_WORK)){
-      
-        work = true; 
-
-        Serial.println("work = true 1");
-
-      }
-      else{
-        work = false;
-        Serial.println("work = false 1");
-        checkShutdown();
-      }
-    }
-    else{
-      work = false;
-      Serial.println("work = false 2");
-      checkShutdown();
-    }
-
-
-    if(!last_work && !work){ // Estava desligado e continuará desligado
-      last_work = work;
-      checkWifi();
-      getTime();
-
-
-      CurrentState = waiting_for_time;
-    }
-
-    if(!last_work && work){ // Estava desligado e irá ligar
-      last_work = work;
-      CurrentState = initialization;
-    }
-
-    if(last_work && !work){ // Estava Ligado e irá desligar
-      last_work = work;
-
-          if(device == 0){ 
-            checkShutdown();
-          }
-
-      CurrentState = waiting_for_time;    
-    }
-
-    if(last_work && work){ //Estava ligado e continuará ligado
-          last_work = work;
-
-          if(cont_time_waiting >= TIME_WAIT){ // Tempo de espera para coleta de dados
-            cont_time_waiting = 0;
-            if(device == 0){
-              CurrentState = fire_detector; 
-            }
-            else{
-              CurrentState = read_eltric_current;
-            }
-          }
-          if(device == 0){  
-            if(cont_check_station_control >= TIME_CHECK_CONTROL){ // Tempo para verificar o ciclo de 15 min
-              cont_check_station_control = 0;
-              stationControl();
-            }
-          }  
-    }
-
-    if (comand_upload){  // Verificar se teve um comando externo para Upload
-      comand_upload = false;
-      getTxt();
-    }
-
-    if(cont_hour >= ONE_HOUR_IN_SECONDS){
-
-      if (WiFi.status() != WL_CONNECTED){
-        wifiConnect();
-      }
-      else{
-        if(debug){
-          Serial.println("Wi-FI: CONNECTED!");
-          cont_hour = 0;
-          updateEpoch();
+        if((hour_RTC >= HOUR_INIT_WORK) && (hour_RTC < HOUR_FINISH_WORK)){ // Está dentro do horário de funcionamento?
+        
+          work_day = true; 
+          Serial.println("Work day!");
+        }
+        else{
+          work_day = false;
+          Serial.println("It's not a work day!");
         }
       }
-    }
-  }
-}
+      else{
+          work_day = false;
+          Serial.println("It's not a work day!");
+      }
+
+  return work_day;
+} 
 
 void initIOs(){
 
   Serial.println("--------------------------------------- initIOs");
 
-  if(status_platform && !fireDetector){ //
-    digitalWrite(RELE_1, HIGH);
-    digitalWrite(RELE_2, LOW);
-  }
+  digitalWrite(RELE_1, HIGH);
+  digitalWrite(RELE_2, LOW);
 
-  CurrentState = read_eltric_current;
-
+  CurrentState = read_sensors;
 }
 
 void checkShutdown(){
 
     Serial.println("--------------------------------------- initIOs");
 
-  if(!digitalRead(RELE_1) || !digitalRead(RELE_2)){
+  if((!digitalRead(RELE_1) || !digitalRead(RELE_2)) && device == MASTER){
 
     digitalWrite(RELE_1, HIGH);
     digitalWrite(RELE_2, HIGH);
@@ -1343,11 +1374,19 @@ void checkShutdown(){
 
 void getTxt(){
 
+  Serial.println("");
+  Serial.println("--------------------------------------- getTxt");
+  Serial.println("");
+
   float version_fw_float;
+
+  Serial.print("PASSEI AQUI 01");
 
   http.begin(url_txt);
   
   int httpCode = http.GET();
+
+   Serial.println("PASSEI AQUI 02");
   
   if (httpCode > 0) {
     if (httpCode == HTTP_CODE_OK) {
@@ -1394,9 +1433,13 @@ void getTxt(){
         Serial.println("The String is OK, it has no unprintable characters.");
       }
 
+      Serial.print("version_fw_float: ");
+      Serial.println(version_fw_float);
 
       version_fw_float = version_fw.toFloat();
 
+      Serial.print("version_fw_float2: ");
+      Serial.println(version_fw_float);
 
     }
   } else {
@@ -1518,60 +1561,218 @@ void reconnect() {
   }
 }
 
-void check_fire(){
+int check_fire(){
 
-  delay(1000);
-  Serial.println("------------------------------------------------------------------------------------------------------------- CheckFireDetector");
+  uint8_t check = 0;
 
-  if(!digitalRead(DETECTOR_FIRE)){
-    cont_fire++;
+  check = digitalRead(DETECTOR_FIRE);
+
+  return check;
+
+}
+
+float calibration_ACS712(){
+
+  bool  finisherCalculate = false;
+  float currentCalculate = 0;
+  float amostras[SAMPLES_CURRENTS];
+  int   amostras_index = 0;
+  float rms = 0;
+
+  while (!finisherCalculate){
+
+      delayMicroseconds(1667);
+
+      amostras[amostras_index] = adc1_get_raw(ADC1_CHANNEL_6);
+      amostras_index++;
+
+      if (amostras_index >= SAMPLES_CURRENTS){
+
+        amostras_index = 0;
+
+      // Serial.println("-------Início Array--------");
+      //  for (int a = 0; a <= SAMPLES_CURRENTS; a++){
+      //    Serial.println(amostras[a]);
+      //  }
+      //  Serial.println("-------Fim Array--------");
+
+        for (int i = 0; i <= (SAMPLES_CURRENTS - 1); i++){
+          rms += amostras[i] * amostras[i];
+        }
+        
+        rms /= (double)SAMPLES_CURRENTS;
+
+        rms = sqrt(rms);
+
+        for (int i = 0; i <= (SAMPLES_CURRENTS - 1); i++){
+          amostras[i] = 0;
+        }
+
+        finisherCalculate = true;
+      }
     
-    delay(500);
-      Serial.println("------------------------------------------------------------------------------------------------------------- #01");
-  }
-  else {
-    cont_fire = 0;
-    CurrentState = read_eltric_current;
-     Serial.println("------------------------------------------------------------------------------------------------------------- #02");
   }
 
+  Serial.print("SET_POINT_RMS: ");
+  Serial.println(rms);
 
-  if(cont_fire >= 20){
+  return rms;
+}
 
-    while (!digitalRead(DETECTOR_FIRE))
-    {
-      CurrentState = fire_detector;
-      fireDetector = true;
-        Serial.println("------------------------------------------------------------------------------------------------------------- Fire");
-      sendSos();
-      delay(500);
+void readSensors(){
 
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Function Read Sensors");
+  }
+
+  electricCurrent = electricCurrentCalc(); // Coleta do valor da corrente elétrica
+
+  rpm = rpmCalc();  // Coleta do RPM
+
+  temperature = temp.readCelsius(); // Coleta da temperatura do tubo
+
+  epochTime = readEpoch();  // Coleta da data em formato Epoch
+
+  if (device == MASTER){  
+    ambientTempHumidity();  // Coleta da temperatura e umidade do ambiente 
+    DateTime now = rtc.now(); // Obtém a data e hora atual do RTC
+    printDate(now); // Chama a função para imprimir a data completa
+  }
+
+  Serial.println("");
+  Serial.print("Estado do sinal FIRE: ");
+  Serial.println(digitalRead(DETECTOR_FIRE));
+  Serial.println("");
+
+  Serial.println("");
+  Serial.print("contagem_do_interrupt: ");
+  Serial.println(contagem_do_interrupt);
+  Serial.println("");
+
+
+  CurrentState = send_data;
+
+}
+
+void updateRTC(){
+
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Function updateRTC");
+  }
+
+  uint8_t  sec_RTC  = 0;
+  uint8_t  min_RTC  = 0;
+  uint8_t  hour_RTC = 0;
+  uint8_t  day_RTC  = 0;
+  uint8_t  mon_RTC  = 0;
+  uint8_t  wday_RTC = 0;
+  uint16_t year_RTC = 0;
+
+
+
+  if(wifiConnect()){ // Verifica se existe conexão com rede wifi
+
+    updateEpoch();
+
+    sec_RTC  = timeinfo.tm_sec;
+    min_RTC  = timeinfo.tm_min;
+    hour_RTC = timeinfo.tm_hour;
+    day_RTC  = timeinfo.tm_mday;
+    mon_RTC  = timeinfo.tm_mon + 1;
+    wday_RTC = timeinfo.tm_wday;
+    year_RTC = timeinfo.tm_year + 1900;
+
+    DateTime dt(year_RTC, mon_RTC, day_RTC, hour_RTC, min_RTC, sec_RTC);
+
+    rtc.adjust(dt); // Ajusta a data e hora do RTC para o valor especificado
+
+    rtcUpdated = 0X01;
+    // Marca o sinalizador indicando que o RTC foi atualizado
+    EEPROM.put(RTC_UPDATED_ADDRESS, rtcUpdated);
+    EEPROM.commit();
+
+    DateTime now = rtc.now(); // Obtém a data e hora atual do RTC
+
+    printDate(now); // Chama a função para imprimir a data completa
+  }
+
+}
+
+// Função para imprimir a data completa no formato "YYYY-MM-DD HH:MM:SS"
+void printDate(DateTime dt) {
+  Serial.print("Data e hora atual: ");
+  // Imprime o ano
+  Serial.print(dt.year());
+  Serial.print("-");
+  // Imprime o mês com 2 dígitos
+  if (dt.month() < 10) Serial.print("0");
+  Serial.print(dt.month());
+  Serial.print("-");
+  // Imprime o dia com 2 dígitos
+  if (dt.day() < 10) Serial.print("0");
+  Serial.print(dt.day());
+  Serial.print(" ");
+  // Imprime a hora com 2 dígitos
+  if (dt.hour() < 10) Serial.print("0");
+  Serial.print(dt.hour());
+  Serial.print(":");
+  // Imprime os minutos com 2 dígitos
+  if (dt.minute() < 10) Serial.print("0");
+  Serial.print(dt.minute());
+  Serial.print(":");
+  // Imprime os segundos com 2 dígitos
+  if (dt.second() < 10) Serial.print("0");
+  Serial.println(dt.second());
+}
+
+void cyles_control(){
+
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Function cyles_control");
+  }
+
+  if(status_platform){
+
+    if((digitalRead(RELE_1) == OFF) && (digitalRead(RELE_2) == OFF)){
+
+      digitalWrite(RELE_1, HIGH);
+      digitalWrite(RELE_2, LOW);
+
+      cont_cicle = 0;
     }
-     fireDetector = false;
-     restart();
-      Serial.println("------------------------------------------------------------------------------------------------------------- #03");
-      
+
+    if (cont_cicle >= TIME_CYCLE){
+
+      digitalWrite(RELE_1, !digitalRead(RELE_1));
+      digitalWrite(RELE_2, !digitalRead(RELE_2));
+      cont_cicle = 0;
+    }
+  }
+}
+
+void main_control(){
+
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- Function main_control");
   }
 
+  enabled_station = checkDayOfWork(); // Utilizo essa variável também na interrupção para saber se é dia de trabalho
 
-}
+  if(enabled_station){
 
-void sendSos(){
+    Serial.print("ENTREI no IF ");
 
-  checkWifi();
-  checkBroker();
+    cyles_control();
 
-  delay(1000);
-  snprintf(messagesSOS, 20, "{\"flag_fire\":%d}", fireDetector);
-  client.publish(outTopicFire, messagesSOS);
-}
-
-void restart(){
-  timerAlarmDisable(timer0);
-  detachInterrupt(PULSE);
-  count_timerpulse = 0;
-  amostras_index = 0;
-  flag_timer = false;
-  CurrentState = initialization;
+  }else{
+      digitalWrite(RELE_1, LOW);
+      digitalWrite(RELE_2, LOW);
+      cont_cicle = 0;
+  }  
+  CurrentState = read_sensors;
 }
 
