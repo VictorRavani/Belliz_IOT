@@ -24,6 +24,11 @@
 
 #include "RTClib.h" //INCLUSÃO DA BIBLIOTECA
 
+#include "cJSON.h"
+
+#include <ArduinoJson.h>
+
+
 //#include "HttpsOTAUpdate.h"
 
 /*Tive um problema com o print e o Tiago add o volatile e voltou a funcionar, dessa forma fica explícito para o compilador. 
@@ -76,6 +81,7 @@ o que poderia levar a um loop infinito se a variável for modificada por uma fon
 #define POWER 1
 #define OFF 0
 #define RTC_UPDATED_ADDRESS 100
+#define CONTROL_STATION 1 // 1 = ON    0 = OFF
 
 /////////////////////////////// DECLARAÇÃO DE VARIÁVEIS /////////////////////////
 
@@ -115,7 +121,7 @@ bool volatile status_platform = true; // Flag indicativa de acionamento ou desli
      
 int count_pulse = 0,
     count_timerpulse = 0, 
-    address = 0,
+    address = 5,
     address_version_fw = 300,
     rpm = 0,
     turn = 0,
@@ -151,14 +157,8 @@ unsigned long epochTime = 0,
 bool volatile fireDetector = false;
 
 char messages[140];
-char messagesSOS[20];
-
-char mac_address [13];
 
 char mac_not_pointers [13];
-
-char topic_sub [20]; 
-char topic_sonoff [20];
 
 const char *sufixo = "/pub";
 
@@ -172,7 +172,7 @@ char resultado2[100];  // Ajuste o tamanho conforme necessário
 
 bool comand_upload = false;
 
-
+bool currentPassage = false;
 
 String mac = "";
 
@@ -220,6 +220,33 @@ String linhas[MAX_LINES]; // Array para armazenar as linhas do arquivo
 uint8_t rtcUpdated = 0XFF;
 
 uint8_t volatile contagem_do_interrupt = 0;
+
+uint8_t stateRele1 = 0;
+
+uint8_t stateRele2 = 0;
+
+char json[65] = "{\"sensor\":\"FATEC\",\"time\":9888,\"data\":[10,11]}";
+
+
+JsonDocument doc;
+
+const char* SSID = "WIFI_MESH_IST";
+const char* Pass = "ac1ce0ss6_mesh";
+uint8_t  Ctrl    = CONTROL_STATION;
+uint8_t  TmJs    = TIME_SEND_JSON;
+uint16_t TmCl    = TIME_CYCLE;
+uint8_t  HrIn    = HOUR_INIT_WORK;
+uint8_t  HrFn    = HOUR_FINISH_WORK;
+
+
+
+//char json_recive [65];
+
+// Tamanho máximo do JSON recebido
+const int MAX_JSON_SIZE = 65;
+
+// Array de caracteres para armazenar o JSON recebido
+char json_receive[MAX_JSON_SIZE] = {0}; // Inicializa com todos os elementos como '\0'
 
 /////////////////////////////// PROTÓTIPOS DE FUNÇÕES /////////////////////////////////////
 
@@ -302,7 +329,7 @@ bool hasNonPrintableCharacters(const String& str);
 // Função para remover caracteres não impressos
 void removeNonPrintableCharacters(String& str);
 
-void callback(char* topic, byte* message, unsigned int length);
+void callback(char* topic, byte* payload, unsigned int length);
 
 void reconnect();
 
@@ -318,6 +345,16 @@ void updateRTC();
 void main_control();
 
 void cyles_control();
+
+void readStateReles();
+
+void deserializando_Json();
+
+void deserializando_Json2();
+
+void flashJsonRead();
+
+void flashJsonWrite();
 
 /////////////////////////////// FUNÇÕES DE CALLBACK ///////////////////////////////////
 
@@ -348,18 +385,63 @@ void IRAM_ATTR Timer1_ISR() { // Interrupção a cada 1seg para contagem de temp
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-  if(debug){
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-  Serial.println();
-  //for (int i = 0; i < length; i++) {
-    Serial.print("[ ");
-    Serial.print((char)payload[0]);
-    Serial.print(" ]");
- // }
-  Serial.println();
-  }
+
+  //char jsonRecebido [52];
+
+  //for(int i =0; i <= 51; i++){
+
+    //jsonRecebido [i] = payload [i];
+
+  //}
+
+//https://github.com/bblanchon/ArduinoJson/issues/932
+
+  //char json[] = "{\"sensor\":\"FATEC\",\"time\":9888,\"data\":[10,11]}";
+  //{"TmJs":10,"Ctrl":"0","TmCl":900,"HrIn":8,"HrFn":17}
+  Serial.println("*************** MENSAGEM RECEBIDA ***************");
+  Serial.print("TOPICO: ");
+  Serial.println(topic);
+  Serial.println("JSON: "); 
+  //Serial.println(payload);
+
+  
+  deserializeJson(doc, payload, length);
+
+  //SSID = doc["SSID"];
+  //Pass = doc["Pass"];
+
+  TmJs = doc["TmJs"]; //TIME_SEND_JSON  
+  Ctrl = doc["Ctrl"]; //CONTROL_STATION
+  TmCl = doc["TmCl"]; //TIME_CYCLE
+  HrIn = doc["HrIn"]; //HOUR_INIT_WORK
+  HrFn = doc["HrFn"]; //HOUR_FINISH_WORK
+
+  
+  //long time = doc["time"];
+  //double latitude = doc["data"][0];
+  //double longitude = doc["data"][1];
+
+    //Print values.
+  //Serial.print("SSID: ");
+  //Serial.println(SSID);
+  //Serial.print("Pass: ");
+  //Serial.println(Pass);
+  Serial.print("TmJs: ");
+  Serial.println(TmJs);
+
+  Serial.print("Ctrl: ");
+  Serial.println(Ctrl);
+
+  Serial.print("TmCl: ");
+  Serial.println(TmCl); 
+
+  Serial.print("HrIn: ");
+  Serial.println(HrIn);
+
+  Serial.print("HrFn: ");
+  Serial.println(HrFn);
+
+  flashJsonWrite();
 
   // Switch on the LED if an 1 was received as first character 
   if(strcmp(topic, outTopicUpOTA) == 0){
@@ -378,6 +460,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
   }
 if(strcmp(topic, outTopicControl) == 0){
+
+    //json = (char)payload[0];
+
+
     if ((char)payload[0] == '1') {
     if(debug)
     Serial.println("LIGA");
@@ -418,6 +504,12 @@ void setup() {
 
   EEPROM.begin(512);
 
+  
+  ///////////////////////////////////////////////////////
+
+
+
+///////////////////////////////////////////////////////////
   esp_reset_reason_t reason = esp_reset_reason();
   
   switch (reason) {
@@ -457,6 +549,8 @@ void setup() {
   timer1Config();
 
   updateEpoch();
+
+  flashJsonRead();
 
   //EEPROM.get(address_version_fw, last_version_fw);
 
@@ -504,8 +598,6 @@ void loop(){
     reconnect();
   }
   client.loop();
-
-  
   executeMachineState();
 }
 
@@ -632,7 +724,7 @@ int getMAC(){
     // Concatene o segundo string no buffer de resultado
     strcat(resultado, sufixo);
 
-    outTopic = resultado;
+    outTopic = resultado; 
 
     // Copie o primeiro string para o buffer de resultado
     strcpy(resultado1, mac_not_pointers);
@@ -640,7 +732,8 @@ int getMAC(){
     // Concatene o segundo string no buffer de resultado
     strcat(resultado1, sufixo2);
 
-    outTopicControl = resultado1;
+    //outTopicControl = resultado1;
+    outTopicControl = "control";
 
     // Copie o primeiro string para o buffer de resultado
     strcpy(resultado2, mac_not_pointers);
@@ -716,7 +809,7 @@ bool brokerConnect(){
     Serial.println("--------------------------------------- Function BROKER Connect");
   }
 
-  if (client.state() == MQTT_CONNECTED){  // Verifica o status da conexão no Broker
+  if (client.state() == MQTT_CONNECTED ){  // Verifica o status da conexão no Broker
 
     brokerConnect = true;
     digitalWrite(GPIO_LED_VD, HIGH);
@@ -821,7 +914,8 @@ bool wifiConnect(){
     Serial.println("--------------------------------------- Function WIFI Connect");
   }
 
-  if (WiFi.status() == WL_CONNECTED){
+
+  if (WiFi.status() == WL_CONNECTED ){
 
     wifiConnected = true;
 
@@ -908,8 +1002,10 @@ void sendData(){
     Serial.println("--------------------------------------- Send Data");
   }
 
-  while (time_for_send <= TIME_SEND_JSON) // Aguardando o tempo para envio.
-  {
+  while (time_for_send <= TmJs){ // Aguardando o tempo para envio.
+  
+    client.loop(); // Importante para receber o Json via mqtt
+
     if(!check_fire()){
       cont_fire++;
     }else {
@@ -941,19 +1037,29 @@ void sendData(){
     EPC: Data em formato Epoch
     HR: Umidade do ambiente 
     TR: Temperatura do ambiente
+    RELE1: 0 = desligado ;  1 = Ligado
+    RELE2: 0 = desligado ;  1 = Ligado
   */
 
-    if(device == MASTER){
+    
 
-      snprintf(messages, 140, "{\"FW\":%.1f,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f,\"EPC\":%d,\"HR\":%.2f,\"TR\":%.2f,\"FIRE\":%d}", last_version_fw, electricCurrent, rpm, temperature, epochTime, humidity_room, temperature_room, fireDetector);
+    if(device == MASTER){
+      readStateReles();
+
+      snprintf(messages, 140, "{\"FW\":%.1f,\"RELE1\":%d,\"RELE2\":%d,\"EPC\":%d,\"HR\":%.2f,\"TR\":%.2f,\"FIRE\":%d,\"MAC\":\"%s\"}", last_version_fw, stateRele1, stateRele2, epochTime, humidity_room, temperature_room, fireDetector, mac_not_pointers);
+      //snprintf(messages, 140, "{\"FW\":%.1f,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f,\"EPC\":%d,\"HR\":%.2f,\"TR\":%.2f,\"FIRE\":%d}", last_version_fw, electricCurrent, rpm, temperature, epochTime, humidity_room, temperature_room, fireDetector);
       client.publish(outTopic, messages);
     }
 
 
     if(device == SLAVE){
 
-    snprintf(messages, 125, "{\"FW\":%.1f,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f,\"EPC\":%d}", last_version_fw, electricCurrent, rpm, temperature, epochTime);
-    client.publish(outTopic, messages);
+      //if(currentPassage){
+
+        Serial.println("SEM CORRENTE");
+        snprintf(messages, 125, "{\"FW\":%.1f,\"A\":%.2f,\"RPM\":%d,\"TE\":%.2f,\"EPC\":%d,\"MAC\":\"%s\"}", last_version_fw, electricCurrent, rpm, temperature, epochTime, mac_not_pointers);
+        client.publish(outTopic, messages);
+     // }
     }
 
     if(debug){
@@ -1018,9 +1124,13 @@ float electricCurrentCalc(){
 
       currentCalculate = (0.0122 * rms) - 0.0035;  // Equação da reta para determinar o valor da corrente. 
 
-      if (currentCalculate <= 0.3){
+      currentPassage = true;
+
+      if (currentCalculate <= 0.5){
 
         currentCalculate = 0.0;
+
+        currentPassage = false;
       }
 
       for (int i = 0; i <= (SAMPLES_CURRENTS - 1); i++){  // Zerando o Array
@@ -1291,7 +1401,7 @@ void stationControl(){
     Serial.println("--------------------------------------- Station Control");
   }
 
-  if(cont_time_cycle >= TIME_CYCLE && status_platform){
+  if((cont_time_cycle >=TmCl) && Ctrl){
 
     cont_time_cycle = 0;
     digitalWrite(RELE_1, !digitalRead(RELE_1));
@@ -1333,7 +1443,7 @@ bool checkDayOfWork(){
  
       if((dayOfWeek >= DAY_WEEK_INIT_WORK) && (dayOfWeek <= DAY_WEEK_FINISH_WORK)){ // É um dia útil?
 
-        if((hour_RTC >= HOUR_INIT_WORK) && (hour_RTC < HOUR_FINISH_WORK)){ // Está dentro do horário de funcionamento?
+        if((hour_RTC >= HrIn) && (hour_RTC < HOUR_FINISH_WORK)){ // Está dentro do horário de funcionamento?
         
           work_day = true; 
           Serial.println("Work day!");
@@ -1632,6 +1742,9 @@ void readSensors(){
 
   temperature = temp.readCelsius(); // Coleta da temperatura do tubo
 
+  Serial.print("TEMPERATURA: ");
+  Serial.println(temperature);
+
   epochTime = readEpoch();  // Coleta da data em formato Epoch
 
   if (device == MASTER){  
@@ -1734,7 +1847,7 @@ void cyles_control(){
     Serial.println("--------------------------------------- Function cyles_control");
   }
 
-  if(status_platform){
+  if(Ctrl){
 
     if((digitalRead(RELE_1) == OFF) && (digitalRead(RELE_2) == OFF)){
 
@@ -1744,7 +1857,7 @@ void cyles_control(){
       cont_cicle = 0;
     }
 
-    if (cont_cicle >= TIME_CYCLE){
+    if (cont_cicle >= TmCl){
 
       digitalWrite(RELE_1, !digitalRead(RELE_1));
       digitalWrite(RELE_2, !digitalRead(RELE_2));
@@ -1776,3 +1889,197 @@ void main_control(){
   CurrentState = read_sensors;
 }
 
+void readStateReles(){
+
+  stateRele1 = digitalRead(RELE_1);
+
+  stateRele2 = digitalRead(RELE_2);
+}
+
+
+void deserializando_Json(){
+
+  Serial.println("**************DESERIALIZANDO JSON********************");
+  Serial.println("");
+
+Serial.print("JSON completo (filtrado): ");
+Serial.println(json_receive);
+
+JsonDocument doc;
+deserializeJson(doc, json_receive);
+
+const char* sensor = doc["sensor"];
+long time          = doc["time"];
+double latitude    = doc["data"][0];
+double longitude   = doc["data"][1];
+
+Serial.print ("Sensor: ");
+Serial.println (sensor);
+
+Serial.print ("time: ");
+Serial.println (time);
+
+Serial.print ("latitude: ");
+Serial.println (latitude);
+
+Serial.print ("longitude: ");
+Serial.println (longitude);
+
+  Serial.println("");
+
+}
+
+void deserializando_Json2(){
+
+  Serial.println("**************DESERIALIZANDO JSON  2  ********************");
+  Serial.println("");
+
+JsonDocument doc;
+deserializeJson(doc, json_receive);
+
+int flag_Web_onOff = doc["control"];
+
+Serial.print ("flag_Web_onOff: ");
+Serial.println (flag_Web_onOff);
+
+Serial.println("");
+
+}
+
+
+
+void flashJsonWrite(){
+
+  address = 0;
+
+  if(debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- flashJsonWrite");
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.writeUChar(address, TmJs); //TIME_SEND_JSON 
+  address += sizeof(TmJs);
+
+  if(debug){
+    Serial.print("TmJs: ");
+    Serial.println(TmJs);
+    Serial.println("");
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.writeUChar(address, Ctrl); //CONTROL_STATION
+  address += sizeof(Ctrl);
+
+  if(debug){
+    Serial.print("Ctrl: ");
+    Serial.println(Ctrl);
+    Serial.println("");
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.writeUShort(address, TmCl); //TIME_CYCLE
+  address += sizeof(TmCl);
+
+  if(debug){
+    Serial.print("TmCl: ");
+    Serial.println(TmCl);
+    Serial.println("");
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.writeUChar(address, HrIn); //HOUR_INIT_WORK
+  address += sizeof(HrIn);
+
+  if(debug){
+    Serial.print("HrIn: ");
+    Serial.println(HrIn);
+    Serial.println("");
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.writeUChar(address, HrFn); //HOUR_FINISH_WORK
+
+  if(debug){
+    Serial.print("HrFn: ");
+    Serial.println(HrFn);
+    Serial.println("");
+    Serial.print("address: ");
+    Serial.println(address);
+  }
+
+  EEPROM.commit();  
+}
+
+void flashJsonRead(){
+
+  address = 0;
+
+  if (debug){
+    Serial.println("");
+    Serial.println("--------------------------------------- flashJsonRead");
+    Serial.print("address: ");
+    Serial.println(address);
+    Serial.println("");
+  }
+
+  EEPROM.get(address, TmJs); //HOUR_FINISH_WORK
+  
+
+  if(debug){
+    Serial.print("address: ");
+    Serial.println(address);
+    Serial.print("TmJs: ");
+    Serial.println(TmJs);
+    Serial.println("");
+  }  
+
+  address += sizeof(TmJs); 
+  EEPROM.get(address, Ctrl); //HOUR_INIT_WORK
+  
+  if(debug){
+    Serial.print("address: ");
+    Serial.println(address);
+    Serial.print("Ctrl: ");
+    Serial.println(Ctrl);
+    Serial.println("");
+  }    
+  address += sizeof(Ctrl); 
+  EEPROM.get(address, TmCl); //TIME_CYCLE
+
+  if(debug){
+    Serial.print("address: ");
+    Serial.println(address);
+    Serial.print("TmCl: ");
+    Serial.println(TmCl);
+    Serial.println("");
+  }   
+
+  address += sizeof(TmCl);
+  EEPROM.get(address, HrIn); //CONTROL_STATION
+
+  if(debug){
+    Serial.print("address: ");
+    Serial.println(address);
+    Serial.print("HrIn: ");
+    Serial.println(HrIn);
+    Serial.println("");
+  }  
+
+  address += sizeof(HrIn);   
+  EEPROM.get(address, HrFn); //TIME_SEND_JSON 
+
+  if(debug){
+    Serial.print("address: ");
+    Serial.println(address);
+    Serial.print("HrFn: ");
+    Serial.println(HrFn);
+    Serial.println("");
+  }   
+
+}
