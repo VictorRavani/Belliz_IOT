@@ -130,8 +130,8 @@ int count_pulse = 0,
     cont_check_station_control = 0,
     sum_sample = 0;
 
-// Master = 0 | Slave = 1
-int device = SLAVE;
+// MASTER = 0 | SLAVE = 1
+int device = MASTER;
 
 int year = 0;
 
@@ -208,8 +208,8 @@ MachineStates CurrentState;
 String url_txt = "https://api.tago.io/file/637f7c0613e3120011a2a95e/Firmware_Belliz_IOT/txt.txt";
 String url_firmware = "https://api.tago.io/file/637f7c0613e3120011a2a95e/Firmware_Belliz_IOT/firmware.bin";
 
-String version_fw = "1.1";
-float last_version_fw = 1.1;
+String version_fw = "1.2";
+float last_version_fw = 1.2;
   
 HTTPClient http;
 
@@ -300,9 +300,6 @@ void eepromRead();
 
 // Função para registro do tempo
 unsigned long readEpoch();
-
-// Função para controle dos ciclos de 15min das estações
-void stationControl();
 
 // Função para controlar o dia de trabalho da estação
 // 1 = Dia de trabalho | 0 = Folga 
@@ -1394,32 +1391,6 @@ void eepromRead(){
   }   
 }
 
-void stationControl(){
-
-  if (debug){
-    Serial.println("");
-    Serial.println("--------------------------------------- Station Control");
-  }
-
-  if((cont_time_cycle >=TmCl) && Ctrl){
-
-    cont_time_cycle = 0;
-    digitalWrite(RELE_1, !digitalRead(RELE_1));
-    digitalWrite(RELE_2, !digitalRead(RELE_2));
-    
-  }
-
-  if(debug){
-    Serial.print("cont_time_cycle: ");
-    Serial.println(cont_time_cycle);
-    Serial.println("");
-    Serial.print("RELE_1: ");
-    Serial.println(digitalRead(RELE_1));
-    Serial.print("RELE_2: ");
-    Serial.println(digitalRead(RELE_2));
-  }
-}
-
 bool checkDayOfWork(){
 
   bool work_day = false;
@@ -1863,6 +1834,9 @@ void cyles_control(){
       digitalWrite(RELE_2, !digitalRead(RELE_2));
       cont_cicle = 0;
     }
+  }else {
+    digitalWrite(RELE_1, LOW);
+    digitalWrite(RELE_2, LOW);
   }
 }
 
@@ -1895,7 +1869,6 @@ void readStateReles(){
 
   stateRele2 = digitalRead(RELE_2);
 }
-
 
 void deserializando_Json(){
 
@@ -1945,8 +1918,6 @@ Serial.println (flag_Web_onOff);
 Serial.println("");
 
 }
-
-
 
 void flashJsonWrite(){
 
