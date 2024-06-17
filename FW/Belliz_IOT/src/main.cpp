@@ -131,7 +131,7 @@ int count_pulse = 0,
     sum_sample = 0;
 
 // MASTER = 0 | SLAVE = 1
-int device = MASTER;
+int device = SLAVE;
 
 int year = 0;
 
@@ -703,8 +703,10 @@ int getMAC(){
     }
 
     cont ++;
-
   }  
+    //return macWithoutDots;
+//}
+
 
   outTopic = mac_not_pointers;
 
